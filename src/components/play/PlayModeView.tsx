@@ -56,6 +56,7 @@ import type {
   ActionButtonBinding,
   BehaviorCard,
   BoardPoint,
+  BuildingBlockConfig,
   CameraCutawayTransition,
   CameraMode,
   CarPresetId,
@@ -65,6 +66,7 @@ import type {
   CritterWarmTrigger,
   DialogueOutputMode,
   DialogueVoiceConfig,
+  DoorConfig,
   DriverTypeId,
   DrivingCameraView,
   DrivingConfig,
@@ -118,6 +120,7 @@ import { PostProcessingPipeline } from '../../three/postProcessingPipeline';
 import { applyVertexPaintStrokesToObject } from '../../three/vertexPainter';
 import { createOptInMeshletPipeline, prepareObjectForMeshletCulling } from '../../three/meshletPipeline';
 import { applyEntityMaterialVariant } from '../../three/nodeMaterialUtils';
+import { applyDoorOpenAnimation, sampleBuildingSurfaceY } from '../../three/buildingBlocks';
 import {
   applyAtmosphere,
   applyLiveRendererQuality,
@@ -449,6 +452,12 @@ interface RuntimeEntity {
   creatureRefs: CreatureAnimRefs | null;
   floatSpinMeshes: THREE.Object3D[];
   cards: BehaviorCard[];
+  elevationY?: number;
+  buildingBlock?: BuildingBlockConfig;
+  doorConfig?: DoorConfig;
+  requiresKey?: boolean;
+  wallTorchLight?: THREE.PointLight;
+  torchFlames?: Array<{ mesh: THREE.Object3D; baseY: number; phase: number }>;
   skitEmote?: SkitBeatEmote | null;
   skitMoving?: boolean;
 }
@@ -490,6 +499,11 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
     label: string;
     itemName: string;
     method: 'interact' | 'walkOver';
+  } | null>(null);
+  const [doorInteractPrompt, setDoorInteractPrompt] = useState<{
+    label: string;
+    isOpen: boolean;
+    locked: boolean;
   } | null>(null);
   const [fishingBanner, setFishingBanner] = useState<'none' | 'waiting' | 'bite'>('none');
   const [inventoryStacks, setInventoryStacks] = useState<InventoryStack[]>([
@@ -2117,6 +2131,7 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
       }
 
       // Runtime entities
+      let playWallTorchLightCount = 0;
       const runtimeEntities: RuntimeEntity[] = activeLevel.entities.map((ent) => {
         let customInst: CustomModelInstance | null = null;
         let fxRuntime: FxEmitterRuntime | null = null;
@@ -2183,15 +2198,24 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
         const [wx, wz] = levelBoardToWorld(activeLevel, ent.position);
         const wy = sampleLevelHeight(activeLevel, wx, wz);
         const extraY = ent.kind === 'platform' ? PlatformMotion.hover(ent.platformPreset) : 0;
-        mesh.position.set(wx, wy + extraY, wz);
+        const elevY = ent.elevationY ?? 0;
+        mesh.position.set(wx, wy + extraY + elevY, wz);
         scene.add(mesh);
 
         const baddieRig = (mesh.userData.baddieRig as BaddieRig | undefined) ?? null;
         const customFlashMats: Array<{ emissive: THREE.Color; emissiveIntensity: number }> = [];
         const floatSpinMeshes: THREE.Object3D[] = [];
+        const torchFlames: Array<{ mesh: THREE.Object3D; baseY: number; phase: number }> = [];
         mesh.traverse((c) => {
           if (c.userData?.floatSpin) {
             floatSpinMeshes.push(c);
+          }
+          if (c.userData?.torchFlame) {
+            torchFlames.push({
+              mesh: c,
+              baseY: Number(c.userData.baseY ?? c.position.y),
+              phase: wx * 0.43 + wz * 0.61,
+            });
           }
           if (ent.kind === 'baddie' && c instanceof THREE.Mesh) {
             const mats = Array.isArray(c.material) ? c.material : [c.material];
@@ -2208,6 +2232,13 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
             }
           }
         });
+        let wallTorchLight: THREE.PointLight | undefined;
+        if (ent.buildingBlock?.shape === 'wallTorch' && playWallTorchLightCount < 8) {
+          playWallTorchLightCount++;
+          wallTorchLight = new THREE.PointLight('#FF9C40', 4.5, 11, 1.8);
+          wallTorchLight.position.set(0, 1.82, 0.38);
+          mesh.add(wallTorchLight);
+        }
         if (ent.kind === 'baddie' && baddieRig && ent.materialVariant) {
           baddieRig.flashMaterials = customFlashMats as unknown as THREE.MeshStandardMaterial[];
         }
@@ -2347,6 +2378,16 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
           creatureRefs: (mesh.userData.creatureAnim as CreatureAnimRefs | undefined) ?? null,
           floatSpinMeshes,
           cards: ent.cards ?? [],
+          elevationY: ent.elevationY,
+          buildingBlock: ent.buildingBlock,
+          doorConfig: ent.doorConfig,
+          requiresKey: Boolean(
+            ent.doorConfig?.requiresKey ||
+              (!ent.doorConfig && ent.kind === 'door') ||
+              (ent.cards ?? []).some((c) => (c.conditions ?? []).some((cond) => cond.key === 'hasKey'))
+          ),
+          wallTorchLight,
+          torchFlames: torchFlames.length > 0 ? torchFlames : undefined,
           skitEmote: null,
           skitMoving: false,
         };
@@ -3081,6 +3122,7 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
       let lastPubYaw = Number.NaN;
       let lastPubSpeed: number | undefined = undefined;
       let lastHarvestPromptKey = '';
+      let lastDoorPromptKey = '';
       let lastNearCraftingBench = false;
       let armorBlockCounter = 0;
 
@@ -3557,6 +3599,7 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
               : 5.8) * heroSpeedMult;
 
           if (isFirstPersonControl && canWalk) {
+            collisionCtx.actorY = heroY;
             // In Character POV: A/D & Left/Right rotate the character left/right (even when standing still);
             // W/S & Up/Down walk forward and backward along the facing direction.
             const turnInput = THREE.MathUtils.clamp(moveX, -1, 1);
@@ -3611,6 +3654,7 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
               stamina = Math.min(100, stamina + dt * 26 * staminaRegenMult);
             }
           } else if (mag > 0.08 && canWalk) {
+            collisionCtx.actorY = heroY;
             const nx = moveX / Math.max(1, mag);
             const nz = moveZ / Math.max(1, mag);
             let worldDX = 0;
@@ -3694,6 +3738,7 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
 
           // Apply physical knockback impulse on hero when bumped by an enemy attack
           if (Math.abs(heroKnockVX) > 0.04 || Math.abs(heroKnockVZ) > 0.04) {
+            collisionCtx.actorY = heroY;
             const [kx, kz] = resolveHorizontalCollision(
               activeLevel,
               heroX + heroKnockVX * simDt,
@@ -3710,10 +3755,29 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
             heroKnockVX = 0;
             heroKnockVZ = 0;
           }
+          collisionCtx.actorY = undefined;
 
-          // Ground & platforms
+          // Ground, modular building surfaces & platforms
           floorY = sampleLevelHeight(activeLevel, heroX, heroZ);
           for (const entData of activeLevel.entities) {
+            if (entData.buildingBlock) {
+              const [bx, bz] = levelBoardToWorld(activeLevel, entData.position);
+              const baseY = sampleLevelHeight(activeLevel, bx, bz) + (entData.elevationY ?? 0);
+              const surfY = sampleBuildingSurfaceY(
+                entData,
+                bx,
+                bz,
+                baseY,
+                heroX,
+                heroZ,
+                heroY,
+                openedDoorIds.has(entData.id)
+              );
+              if (surfY !== null) {
+                floorY = Math.max(floorY, surfY);
+              }
+              continue;
+            }
             if (entData.kind !== 'platform') continue;
             const rt = runtimeEntities.find((r) => r.id === entData.id);
             if (!rt) continue;
@@ -5271,6 +5335,8 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
 
           // Entity updates & collisions
           const baddiesRemaining = runtimeEntities.some((r) => r.kind === 'baddie' && r.alive);
+          let nearestDoorPrompt: { label: string; isOpen: boolean; locked: boolean } | null = null;
+          let nearestDoorPromptDist = 999;
 
           for (const rt of runtimeEntities) {
             if (!rt.alive) continue;
@@ -5280,8 +5346,26 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
             for (let fi = 0; fi < rt.floatSpinMeshes.length; fi++) {
               rt.floatSpinMeshes[fi].rotation.y += dt * 1.8;
             }
+            if (rt.torchFlames && rt.torchFlames.length > 0) {
+              for (let tf = 0; tf < rt.torchFlames.length; tf++) {
+                const item = rt.torchFlames[tf];
+                const flick =
+                  Math.sin(gameElapsed * 14 + item.phase) * 0.14 +
+                  Math.cos(gameElapsed * 23 + item.phase * 1.7) * 0.08;
+                item.mesh.scale.set(1 + flick * 0.28, 1 + flick * 0.55, 1 + flick * 0.28);
+                item.mesh.position.y = item.baseY + flick * 0.04;
+              }
+            }
+            if (rt.wallTorchLight) {
+              rt.wallTorchLight.intensity = 4.3 + Math.sin(gameElapsed * 12 + rt.x * 0.4) * 0.55;
+            }
+            if (rt.kind === 'door' || rt.buildingBlock?.shape === 'trapdoor') {
+              applyDoorOpenAnimation(rt.mesh, rt.opened, dt);
+            }
 
             const dist = Math.hypot(rt.x - heroX, rt.z - heroZ);
+            const rtBaseY = sampleLevelHeight(activeLevel, rt.x, rt.z) + (rt.elevationY ?? 0);
+            const vertOk = Math.abs(heroY - rtBaseY) < 2.2;
 
             // Live Particle & FX Emitter simulation (auto-paused whenever Play Mode pauses)
             if (rt.fxRuntime) {
@@ -5408,7 +5492,7 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
               continue;
             }
 
-            if (rt.kind === 'pickup' && dist < 1.55) {
+            if (rt.kind === 'pickup' && dist < 1.55 && vertOk) {
               rt.alive = false;
               rt.mesh.visible = false;
               const targetItemId = rt.pickupItemId || 'wild_berries';
@@ -5416,7 +5500,7 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
               const isTool = itemDef?.category === 'tool';
               addItemToBag(targetItemId, rt.pickupQty, isTool);
               AudioEngine.playSound(activeLevel.audio.coin);
-              spawnCombatSparks(rt.x, sampleLevelHeight(activeLevel, rt.x, rt.z) + 0.8, rt.z, itemDef?.colorHex ?? '#FACC15', 7, 4.5);
+              spawnCombatSparks(rt.x, rtBaseY + 0.8, rt.z, itemDef?.colorHex ?? '#FACC15', 7, 4.5);
               if (itemDef?.toolKind === 'axe') {
                 showToast(`Found ${itemDef.name}! Equipped — press F near trees to chop.`);
               } else if (itemDef?.toolKind === 'fishingPole') {
@@ -5426,7 +5510,7 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
                   `Collected ${rt.pickupQty > 1 ? `${rt.pickupQty}× ` : ''}${itemDef?.name ?? rt.name}!`
                 );
               }
-            } else if (rt.kind === 'key' && dist < 1.35) {
+            } else if (rt.kind === 'key' && dist < 1.35 && vertOk) {
               rt.alive = false;
               rt.mesh.visible = false;
               keys += 1;
@@ -5435,7 +5519,7 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
               }
               AudioEngine.playSound(activeLevel.audio.coin);
               showToast(`Picked up ${rt.name}!`);
-            } else if (rt.kind === 'treasure' && !rt.opened && dist < 1.5) {
+            } else if (rt.kind === 'treasure' && !rt.opened && dist < 1.5 && vertOk) {
               rt.opened = true;
               rt.alive = false;
               rt.mesh.visible = false;
@@ -5450,11 +5534,27 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
               } else {
                 showToast(`Opened ${rt.name}: +3 coins!`);
               }
+            } else if (rt.buildingBlock?.shape === 'trapdoor') {
+              if (dist < 2.25 && vertOk) {
+                if (dist < nearestDoorPromptDist) {
+                  nearestDoorPromptDist = dist;
+                  nearestDoorPrompt = { label: rt.name, isOpen: rt.opened, locked: false };
+                }
+                if (didInteract && !interactConsumed) {
+                  interactConsumed = true;
+                  rt.opened = !rt.opened;
+                  if (rt.opened) openedDoorIds.add(rt.id);
+                  else openedDoorIds.delete(rt.id);
+                  AudioEngine.playSound(activeLevel.audio.door);
+                  showToast(`${rt.name} ${rt.opened ? 'opened' : 'closed'}`);
+                }
+              }
             } else if (
               (rt.kind === 'prop' || rt.kind === 'scenery' || rt.kind === 'light') &&
               rt.pickupable &&
               rt.pickupItemId &&
-              dist < 1.55
+              dist < 1.55 &&
+              vertOk
             ) {
               rt.alive = false;
               rt.mesh.visible = false;
@@ -5906,19 +6006,34 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
               } else if (existingSpeech && existingSpeech.isProximity && !inBubblesMode && rtOutputMode !== 'audio') {
                 dismissCharacterSpeech(rt.id);
               }
-            } else if (rt.kind === 'door' && !rt.opened && dist < 2.4 && (didInteract || keys > 0)) {
-              interactConsumed = true;
-              if (keys > 0) {
-                keys -= 1;
-                rt.opened = true;
-                openedDoorIds.add(rt.id);
-                AudioEngine.playSound(activeLevel.audio.door);
-                rt.mesh.traverse((child) => {
-                  if (child.userData?.doorLeaf) child.visible = false;
-                });
-                showToast(`${rt.name} unlocked!`);
-              } else if (didInteract) {
-                showToast('Locked! Find a key first.');
+            } else if (rt.kind === 'door') {
+              if (dist < 2.6 && vertOk) {
+                const isLocked = Boolean(rt.requiresKey && !rt.opened && keys === 0);
+                if (dist < nearestDoorPromptDist) {
+                  nearestDoorPromptDist = dist;
+                  nearestDoorPrompt = { label: rt.name, isOpen: rt.opened, locked: isLocked };
+                }
+                if (!rt.requiresKey) {
+                  if (didInteract && !interactConsumed) {
+                    interactConsumed = true;
+                    rt.opened = !rt.opened;
+                    if (rt.opened) openedDoorIds.add(rt.id);
+                    else openedDoorIds.delete(rt.id);
+                    AudioEngine.playSound(activeLevel.audio.door);
+                    showToast(`${rt.name} ${rt.opened ? 'opened' : 'closed'}`);
+                  }
+                } else if (!rt.opened && (didInteract || (keys > 0 && dist < 2.2))) {
+                  interactConsumed = true;
+                  if (keys > 0) {
+                    keys -= 1;
+                    rt.opened = true;
+                    openedDoorIds.add(rt.id);
+                    AudioEngine.playSound(activeLevel.audio.door);
+                    showToast(`${rt.name} unlocked!`);
+                  } else if (didInteract) {
+                    showToast('Locked! Find a key first.');
+                  }
+                }
               }
             } else if (rt.kind === 'baddie') {
               rt.attackCooldown = Math.max(0, rt.attackCooldown - simDt);
@@ -6018,7 +6133,7 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
                     curDist > 0.01
                       ? (curDx / curDist) * rt.attackDirX + (curDz / curDist) * rt.attackDirZ
                       : 1;
-                  const ryCheck = sampleLevelHeight(activeLevel, rt.x, rt.z);
+                  const ryCheck = sampleLevelHeight(activeLevel, rt.x, rt.z) + (rt.elevationY ?? 0);
                   if (curDist < hitReach && (dot > 0.12 || curDist < 1.15) && Math.abs(heroY - ryCheck) < 1.75) {
                     rt.strikeDidHit = true;
                     let incomingDmg = 1;
@@ -6293,7 +6408,7 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
                 }
               }
 
-              const ry = sampleLevelHeight(activeLevel, rt.x, rt.z);
+              const ry = sampleLevelHeight(activeLevel, rt.x, rt.z) + (rt.elevationY ?? 0);
               const baseY = Math.max(-1, ry);
               rt.mesh.position.set(rt.x, baseY + rt.yOffset, rt.z);
 
@@ -6340,6 +6455,14 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
             }
           }
           mechLevelStartsFired = true;
+
+          const doorPromptKey = nearestDoorPrompt
+            ? `${nearestDoorPrompt.label}:${nearestDoorPrompt.isOpen}:${nearestDoorPrompt.locked}`
+            : '';
+          if (doorPromptKey !== lastDoorPromptKey) {
+            lastDoorPromptKey = doorPromptKey;
+            setDoorInteractPrompt(nearestDoorPrompt);
+          }
 
           // --- Live Camera Cutaways, Story Skits & Logic BehaviorCards ---
           const levelSkits = activeLevel.storySkits ?? [];
@@ -7539,6 +7662,7 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
       islandAbort?.abort();
       islandAbort = null;
       setHarvestPrompt(null);
+      setDoorInteractPrompt(null);
       liveQualityTargetRef.current = null;
       cancelAnimationFrame(frameId);
       clearTimeout(frameId);
@@ -8263,6 +8387,29 @@ export const PlayModeView: React.FC<{ store: MakerStore }> = ({ store }) => {
           <span>
             Press <span className="px-1.5 py-0.5 mx-0.5 rounded bg-white/15 font-mono text-[11px]">E</span> to use{' '}
             <span className="text-[#F59E0B]">Crafting Bench</span>
+          </span>
+        </div>
+      )}
+
+      {/* Door / Trapdoor Interaction Prompt */}
+      {controlsActive && doorInteractPrompt && !nearCraftingBench && !harvestPrompt && (
+        <div
+          className={`fixed ${
+            unlockedPowers.length > 0 ? 'bottom-32' : 'bottom-24'
+          } left-1/2 -translate-x-1/2 px-4 py-2 rounded-xl bg-[#11141D]/92 border border-[#7C5CFF]/55 text-white text-xs font-extrabold shadow-xl z-30 flex items-center gap-2 whitespace-nowrap`}
+        >
+          <span>
+            {doorInteractPrompt.locked ? (
+              <>
+                <span className="text-[#FACC15]">{doorInteractPrompt.label}</span> is locked — find a key!
+              </>
+            ) : (
+              <>
+                Press <span className="px-1.5 py-0.5 mx-0.5 rounded bg-white/15 font-mono text-[11px]">E</span> to{' '}
+                {doorInteractPrompt.isOpen ? 'close' : 'open'}{' '}
+                <span className="text-[#A78BFA]">{doorInteractPrompt.label}</span>
+              </>
+            )}
           </span>
         </div>
       )}

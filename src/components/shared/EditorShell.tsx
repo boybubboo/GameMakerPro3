@@ -1,9 +1,10 @@
-import React, { Profiler, useState } from 'react';
+import React, { Profiler, useEffect, useRef, useState } from 'react';
 import {
   Box,
   ChevronDown,
   ChevronLeft,
   Clapperboard,
+  FileArchive,
   Film,
   Lightbulb,
   Map as MapIcon,
@@ -28,6 +29,7 @@ import { MotionStage } from '../stages/MotionStage';
 import { PublishStage } from '../stages/PublishStage';
 import { WorldStage } from '../stages/WorldStage';
 import { AssetVaultModal } from './AssetVaultModal';
+import { ExportProjectZipModal } from './ExportProjectZipModal';
 import { MakerIcon } from './IconMap';
 import { IdeasModal } from './IdeasModal';
 import { LogicFlowModal } from './LogicFlowModal';
@@ -61,16 +63,101 @@ const STAGE_TABS: { id: StageTab; title: string; symbol: string }[] = [
   { id: 'publish', title: 'Publish', symbol: 'paperplane.fill' },
 ];
 
+const AUTO_SAVE_DEBOUNCE_MS = 600;
+const EDITOR_AUTOSAVE_META_KEY = 'maker.autosave.meta.v1';
+
 export const EditorShell: React.FC<{ store: MakerStore }> = ({ store }) => {
-  const { currentProject, currentLevel, levelIndex } = store;
+  const { currentProject, currentLevel, levelIndex, saveProjectStateNow } = store;
   const [levelMenuOpen, setLevelMenuOpen] = useState(false);
   const [showingSkybox, setShowingSkybox] = useState(false);
   const [showingPostFx, setShowingPostFx] = useState(false);
+  const [showingExportZip, setShowingExportZip] = useState(false);
+
+  const lastProjectIdRef = useRef<string | null>(null);
+  const lastSeenProjectRef = useRef(currentProject);
+  const pendingAutoSaveRef = useRef(false);
+  const autoSaveTimerRef = useRef<number | null>(null);
 
   useEditorResourceMonitor({
     stage: store.selectedTab,
     projectId: currentProject?.id ?? null,
   });
+
+  // Debounced auto-save: persists project state to localStorage after edits settle
+  useEffect(() => {
+    if (!currentProject) {
+      lastProjectIdRef.current = null;
+      lastSeenProjectRef.current = null;
+      pendingAutoSaveRef.current = false;
+      return;
+    }
+
+    // Opening or switching projects is not an edit; establish baseline reference
+    if (lastProjectIdRef.current !== currentProject.id) {
+      lastProjectIdRef.current = currentProject.id;
+      lastSeenProjectRef.current = currentProject;
+      pendingAutoSaveRef.current = false;
+      return;
+    }
+
+    if (lastSeenProjectRef.current === currentProject) {
+      return;
+    }
+    lastSeenProjectRef.current = currentProject;
+    pendingAutoSaveRef.current = true;
+
+    if (autoSaveTimerRef.current !== null) {
+      window.clearTimeout(autoSaveTimerRef.current);
+    }
+
+    const levelId = currentLevel?.id ?? null;
+    const tab = store.selectedTab;
+    const projectId = currentProject.id;
+
+    autoSaveTimerRef.current = window.setTimeout(() => {
+      autoSaveTimerRef.current = null;
+      pendingAutoSaveRef.current = false;
+      saveProjectStateNow(true);
+      try {
+        localStorage.setItem(
+          EDITOR_AUTOSAVE_META_KEY,
+          JSON.stringify({
+            projectId,
+            levelId,
+            tab,
+            savedAt: new Date().toISOString(),
+          })
+        );
+      } catch {
+        // ignore localStorage quota errors
+      }
+    }, AUTO_SAVE_DEBOUNCE_MS);
+
+    return () => {
+      if (autoSaveTimerRef.current !== null) {
+        window.clearTimeout(autoSaveTimerRef.current);
+        autoSaveTimerRef.current = null;
+      }
+    };
+  }, [currentProject, currentLevel?.id, store.selectedTab, saveProjectStateNow]);
+
+  // Flush any pending debounced auto-save if EditorShell unmounts or page hides
+  useEffect(() => {
+    const flushPending = () => {
+      if (!pendingAutoSaveRef.current) return;
+      if (autoSaveTimerRef.current !== null) {
+        window.clearTimeout(autoSaveTimerRef.current);
+        autoSaveTimerRef.current = null;
+      }
+      pendingAutoSaveRef.current = false;
+      saveProjectStateNow(true);
+    };
+    window.addEventListener('pagehide', flushPending);
+    return () => {
+      window.removeEventListener('pagehide', flushPending);
+      flushPending();
+    };
+  }, [saveProjectStateNow]);
 
   if (!currentProject) return null;
 
@@ -352,6 +439,21 @@ export const EditorShell: React.FC<{ store: MakerStore }> = ({ store }) => {
           </button>
         </div>
 
+        {/* Export Project ZIP */}
+        <button
+          type="button"
+          onClick={() => setShowingExportZip(true)}
+          title="Export adventure as a downloadable .zip archive"
+          className={`inline-flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-bold shrink-0 whitespace-nowrap transition-colors ${
+            showingExportZip
+              ? 'bg-[#7C5CFF]/18 text-[#7C5CFF] ring-1 ring-[#7C5CFF]/45'
+              : 'bg-slate-100 dark:bg-[#1F2430] hover:bg-slate-200 dark:hover:bg-[#272D3C]'
+          }`}
+        >
+          <FileArchive size={13} className="text-[#7C5CFF]" />
+          <span className="hidden sm:inline">Export</span>
+        </button>
+
         {/* Play */}
         <button
           type="button"
@@ -438,6 +540,10 @@ export const EditorShell: React.FC<{ store: MakerStore }> = ({ store }) => {
 
         {showingPostFx && (
           <PostProcessingMenuModal store={store} onClose={() => setShowingPostFx(false)} />
+        )}
+
+        {showingExportZip && (
+          <ExportProjectZipModal store={store} onClose={() => setShowingExportZip(false)} />
         )}
 
         <PersistentMinimapHUD store={store} />

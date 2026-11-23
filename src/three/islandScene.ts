@@ -25,6 +25,7 @@ import {
   materialColor,
   materialDiffuseRoughness,
   materialOpacity,
+  materialRoughness,
   max,
   mix,
   modelWorldMatrix,
@@ -45,7 +46,14 @@ import {
   vec4,
 } from 'three/tsl';
 import { RoomEnvironment } from 'three/addons/environments/RoomEnvironment.js';
-import { enableDiffuseRoughnessEon, upgradeToNodeMaterial } from './nodeMaterialUtils';
+import {
+  applyDegradeLayersTsl,
+  applyDegradeRoughnessTsl,
+  createMaterialVariantInstance,
+  enableDiffuseRoughnessEon,
+  getSharedWeatheringBaseMaterial,
+  upgradeToNodeMaterial,
+} from './nodeMaterialUtils';
 import {
   applyBotwStyleToObject,
   attachBotwPainterlyShader,
@@ -96,6 +104,7 @@ import {
   RiverCrossing,
   sampleLevelHeight,
   sampleTerrainHeight,
+  sampleTerrainWeathering,
   SIDE_SCROLLER_SEGMENTS,
 } from '../utils/terrain';
 import {
@@ -1191,6 +1200,25 @@ function createTerrainMaterial(
     const microDetail = float(0.96).add(orgFine.sub(0.5).mul(0.09));
     texCol.mulAssign(microDetail);
 
+    const vWeather0 = attribute('aWeather0', 'vec4');
+    const vWeather1 = attribute('aWeather1', 'float');
+    const chipFromCrack = vWeather0.y.mul(0.55);
+    const mudWet = vWeather0.w.mul(0.32);
+    texCol.assign(
+      applyDegradeLayersTsl(
+        texCol,
+        vWeather0.x,
+        vWeather0.y,
+        chipFromCrack,
+        vWeather0.z,
+        vWeather0.w,
+        vWeather1,
+        float(0.0),
+        float(0.0),
+        mudWet
+      )
+    );
+
     const wet = float(1.0).sub(smoothstep(-1.72, float(-1.12).add(edgeJitter.mul(0.25)), wp.y));
     texCol.assign(mix(texCol, texCol.mul(isToon ? 0.64 : 0.6), wet.mul(isToon ? 0.52 : 0.58)));
     const submerged = float(1.0).sub(smoothstep(-2.08, -1.52, wp.y));
@@ -1218,6 +1246,22 @@ function createTerrainMaterial(
     flatShading: false,
   });
   mat.colorNode = terrainColorNode;
+  mat.roughnessNode = Fn(() => {
+    const vWeather0 = attribute('aWeather0', 'vec4');
+    const vWeather1 = attribute('aWeather1', 'float');
+    return applyDegradeRoughnessTsl(
+      materialRoughness,
+      vWeather0.x,
+      vWeather0.y,
+      vWeather0.y.mul(0.55),
+      vWeather0.z,
+      vWeather0.w,
+      vWeather1,
+      float(0.0),
+      float(0.0),
+      vWeather0.w.mul(0.32)
+    );
+  })();
   mat.diffuseRoughnessNode = materialDiffuseRoughness;
   attachBotwPainterlyShader(mat, { rimStrengthScale: 0.42, shadowLiftScale: 0.85 });
   return mat;
@@ -1463,18 +1507,30 @@ function buildDungeonScene(level: GameLevel, customAssets: CustomAssetMeta[]): I
         0.86
       ) as THREE.MeshStandardMaterial;
 
-      const wallMesh = new THREE.Mesh(new THREE.BoxGeometry(w, box.height, d), wMat);
+      const wallSegX = Math.min(8, Math.max(2, Math.round(w / 3)));
+      const wallSegY = Math.min(6, Math.max(2, Math.round(box.height / 2)));
+      const wallSegZ = Math.min(8, Math.max(2, Math.round(d / 3)));
+      const wallMesh = new THREE.Mesh(
+        new THREE.BoxGeometry(w, box.height, d, wallSegX, wallSegY, wallSegZ),
+        wMat
+      );
       wallMesh.position.set(cx, box.height * 0.5, cz);
       wallMesh.castShadow = true;
       wallMesh.receiveShadow = true;
       group.add(wallMesh);
 
       // Stone / metal coping cap & plinth base
-      const cap = new THREE.Mesh(new THREE.BoxGeometry(w + 0.25, 0.36, d + 0.25), trimStoneMat);
+      const cap = new THREE.Mesh(
+        new THREE.BoxGeometry(w + 0.25, 0.36, d + 0.25, Math.min(6, wallSegX), 1, Math.min(6, wallSegZ)),
+        trimStoneMat
+      );
       cap.position.set(cx, box.height + 0.12, cz);
       group.add(cap);
 
-      const plinth = new THREE.Mesh(new THREE.BoxGeometry(w + 0.28, 0.45, d + 0.28), trimStoneMat);
+      const plinth = new THREE.Mesh(
+        new THREE.BoxGeometry(w + 0.28, 0.45, d + 0.28, Math.min(6, wallSegX), 1, Math.min(6, wallSegZ)),
+        trimStoneMat
+      );
       plinth.position.set(cx, 0.22, cz);
       plinth.receiveShadow = true;
       group.add(plinth);
@@ -1638,7 +1694,17 @@ function buildCastleScene(level: GameLevel, customAssets: CustomAssetMeta[]): Is
       0.86
     );
 
-    const mesh = new THREE.Mesh(new THREE.BoxGeometry(w, box.height, d), wallMat);
+    const mesh = new THREE.Mesh(
+      new THREE.BoxGeometry(
+        w,
+        box.height,
+        d,
+        Math.min(8, Math.max(2, Math.round(w / 3))),
+        Math.min(6, Math.max(2, Math.round(box.height / 2))),
+        Math.min(8, Math.max(2, Math.round(d / 3)))
+      ),
+      wallMat
+    );
     mesh.position.set(cx, box.height * 0.5, cz);
     mesh.castShadow = true;
     mesh.receiveShadow = true;
@@ -2099,6 +2165,7 @@ function collectCanopyConfigAssetIds(
 interface TerrainSnapshotEntry {
   heightsRef: TerrainData['heights'];
   layersRef: TerrainData['layers'];
+  weatheringRef: TerrainData['weathering'];
   revision: number;
   size: number;
   renderSize: number;
@@ -2107,6 +2174,8 @@ interface TerrainSnapshotEntry {
   colors: Float32Array;
   w0: Float32Array;
   w1: Float32Array;
+  weather0: Float32Array;
+  weather1: Float32Array;
   normals: Float32Array;
   indices: Uint16Array | Uint32Array;
   waterDepthTexData: Float32Array;
@@ -2204,12 +2273,15 @@ export function buildIslandMesh(
   let colors: Float32Array;
   let w0: Float32Array;
   let w1: Float32Array;
+  let weather0: Float32Array;
+  let weather1: Float32Array;
   let waterDepthTexData: Float32Array;
 
   const snapIdx = cachedTerrainSnapshots.findIndex(
     (s) =>
       s.heightsRef === terrain.heights &&
       s.layersRef === terrain.layers &&
+      s.weatheringRef === terrain.weathering &&
       s.revision === (terrain.revision ?? 0) &&
       s.size === terrain.size &&
       s.renderSize === renderSize &&
@@ -2223,11 +2295,15 @@ export function buildIslandMesh(
     colors = snap.colors.slice();
     w0 = snap.w0.slice();
     w1 = snap.w1.slice();
+    weather0 = snap.weather0.slice();
+    weather1 = snap.weather1.slice();
     waterDepthTexData = snap.waterDepthTexData.slice();
     geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
     geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
     geo.setAttribute('aW0', new THREE.BufferAttribute(w0, 4));
     geo.setAttribute('aW1', new THREE.BufferAttribute(w1, 3));
+    geo.setAttribute('aWeather0', new THREE.BufferAttribute(weather0, 4));
+    geo.setAttribute('aWeather1', new THREE.BufferAttribute(weather1, 1));
     geo.setAttribute('normal', new THREE.BufferAttribute(snap.normals.slice(), 3));
     geo.setIndex(new THREE.BufferAttribute(snap.indices, 1));
   } else {
@@ -2235,9 +2311,20 @@ export function buildIslandMesh(
     colors = new Float32Array(renderWidth * renderWidth * 3);
     w0 = new Float32Array(renderWidth * renderWidth * 4);
     w1 = new Float32Array(renderWidth * renderWidth * 3);
+    weather0 = new Float32Array(renderWidth * renderWidth * 4);
+    weather1 = new Float32Array(renderWidth * renderWidth);
     const indicesList: number[] = [];
 
-    populateSubdividedTerrainAttributes(terrain, renderSize, positions, colors, w0, w1);
+    populateSubdividedTerrainAttributes(
+      terrain,
+      renderSize,
+      positions,
+      colors,
+      w0,
+      w1,
+      weather0,
+      weather1
+    );
 
     for (let row = 0; row < renderSize; row++) {
       for (let col = 0; col < renderSize; col++) {
@@ -2267,6 +2354,8 @@ export function buildIslandMesh(
     geo.setAttribute('color', new THREE.BufferAttribute(colors, 3));
     geo.setAttribute('aW0', new THREE.BufferAttribute(w0, 4));
     geo.setAttribute('aW1', new THREE.BufferAttribute(w1, 3));
+    geo.setAttribute('aWeather0', new THREE.BufferAttribute(weather0, 4));
+    geo.setAttribute('aWeather1', new THREE.BufferAttribute(weather1, 1));
     geo.setIndex(new THREE.BufferAttribute(indexArray, 1));
     geo.computeVertexNormals();
 
@@ -2277,6 +2366,7 @@ export function buildIslandMesh(
     cachedTerrainSnapshots.unshift({
       heightsRef: terrain.heights,
       layersRef: terrain.layers,
+      weatheringRef: terrain.weathering,
       revision: terrain.revision ?? 0,
       size: terrain.size,
       renderSize,
@@ -2285,6 +2375,8 @@ export function buildIslandMesh(
       colors: colors.slice(),
       w0: w0.slice(),
       w1: w1.slice(),
+      weather0: weather0.slice(),
+      weather1: weather1.slice(),
       normals: normalArray.slice(),
       indices: indexArray,
       waterDepthTexData: waterDepthTexData.slice(),
@@ -2928,6 +3020,8 @@ function populateSubdividedTerrainAttributes(
   colors: Float32Array,
   w0: Float32Array,
   w1: Float32Array,
+  weather0: Float32Array,
+  weather1: Float32Array,
   bounds?: { minRow: number; maxRow: number; minCol: number; maxCol: number }
 ) {
   const srcSize = terrain.size;
@@ -2939,6 +3033,8 @@ function populateSubdividedTerrainAttributes(
   const rEnd = bounds ? Math.min(renderSize, bounds.maxRow) : renderSize;
   const cStart = bounds ? Math.max(0, bounds.minCol) : 0;
   const cEnd = bounds ? Math.min(renderSize, bounds.maxCol) : renderSize;
+  const hasWeathering =
+    Boolean(terrain.weathering) && terrain.weathering!.length === srcWidth * srcWidth;
 
   // Separable 5-tap Gaussian weights [1, 4, 6, 4, 1] for buttery multi-material edge blending
   const gauss = [1, 4, 6, 4, 1];
@@ -3026,6 +3122,21 @@ function populateSubdividedTerrainAttributes(
       colors[idx * 3] = shade;
       colors[idx * 3 + 1] = shade;
       colors[idx * 3 + 2] = shade;
+
+      if (hasWeathering) {
+        const ws = sampleTerrainWeathering(terrain, vx, vz);
+        weather0[idx * 4 + 0] = ws.moss;
+        weather0[idx * 4 + 1] = ws.cracks;
+        weather0[idx * 4 + 2] = ws.scorch;
+        weather0[idx * 4 + 3] = ws.mud;
+        weather1[idx] = ws.frost;
+      } else {
+        weather0[idx * 4 + 0] = 0;
+        weather0[idx * 4 + 1] = 0;
+        weather0[idx * 4 + 2] = 0;
+        weather0[idx * 4 + 3] = 0;
+        weather1[idx] = 0;
+      }
     }
   }
 }
@@ -3046,7 +3157,9 @@ export function updateIslandTerrainGeometryInPlace(
   const colAttr = geo.attributes.color as THREE.BufferAttribute | undefined;
   const w0Attr = geo.attributes.aW0 as THREE.BufferAttribute | undefined;
   const w1Attr = geo.attributes.aW1 as THREE.BufferAttribute | undefined;
-  if (!posAttr || !colAttr || !w0Attr || !w1Attr) return false;
+  const weather0Attr = geo.attributes.aWeather0 as THREE.BufferAttribute | undefined;
+  const weather1Attr = geo.attributes.aWeather1 as THREE.BufferAttribute | undefined;
+  if (!posAttr || !colAttr || !w0Attr || !w1Attr || !weather0Attr || !weather1Attr) return false;
 
   const renderSize = handles.terrainRenderSize;
   let bounds: { minRow: number; maxRow: number; minCol: number; maxCol: number } | undefined;
@@ -3068,12 +3181,16 @@ export function updateIslandTerrainGeometryInPlace(
     colAttr.array as Float32Array,
     w0Attr.array as Float32Array,
     w1Attr.array as Float32Array,
+    weather0Attr.array as Float32Array,
+    weather1Attr.array as Float32Array,
     bounds
   );
   posAttr.needsUpdate = true;
   colAttr.needsUpdate = true;
   w0Attr.needsUpdate = true;
   w1Attr.needsUpdate = true;
+  weather0Attr.needsUpdate = true;
+  weather1Attr.needsUpdate = true;
   geo.computeVertexNormals();
   geo.computeBoundingSphere();
   handles.grassSystem?.updateTerrainData(terrain, brushArea);
@@ -3090,10 +3207,10 @@ export function updateIslandTerrainGeometryInPlace(
 }
 
 function buildMountainCaveInterior(
-  stoneMat: THREE.MeshStandardMaterial,
-  darkInteriorMat: THREE.MeshStandardMaterial,
-  mossMat: THREE.MeshStandardMaterial,
-  mossBrightMat: THREE.MeshStandardMaterial
+  stoneMat: THREE.Material,
+  darkInteriorMat: THREE.Material,
+  mossMat: THREE.Material,
+  mossBrightMat: THREE.Material
 ): THREE.Group {
   const g = new THREE.Group();
   g.position.set(MountainCave.x, MountainCave.floorY, MountainCave.z);
@@ -3436,36 +3553,95 @@ function buildMountainCaveInterior(
 function buildCavesGroup(level: GameLevel, caves: CaveGrotto[]): THREE.Group {
   const group = new THREE.Group();
   const atlas = getTerrainTextureAtlas();
-  const stoneMat = enableDiffuseRoughnessEon(
-    new THREE.MeshStandardMaterial({
-      map: atlas.craggyCaveRock,
-      color: '#6C7382',
-      roughness: 0.9,
-      flatShading: true,
-    }),
-    0.92
-  ) as THREE.MeshStandardMaterial;
-  const darkInteriorMat = enableDiffuseRoughnessEon(
-    new THREE.MeshStandardMaterial({
-      map: atlas.craggyCaveRock,
-      color: '#464C59',
-      roughness: 0.94,
-      flatShading: true,
-    }),
-    0.94
-  ) as THREE.MeshStandardMaterial;
   const customCaveTex = level.sceneryTextures?.cave;
-  if (customCaveTex?.enabled && customCaveTex.textureId) {
-    applySurfaceTextureToMaterial(stoneMat, customCaveTex, {
-      baseTintHex: '#8E96A6',
-      preserveFlatShading: true,
-    });
-    applySurfaceTextureToMaterial(darkInteriorMat, customCaveTex, {
-      baseTintHex: '#5E6573',
-      preserveFlatShading: true,
-    });
-    darkInteriorMat.color.multiplyScalar(0.76);
-  }
+
+  const resolveCaveMaterialPair = (x: number, z: number) => {
+    const baseStone = enableDiffuseRoughnessEon(
+      new THREE.MeshStandardMaterial({
+        map: atlas.craggyCaveRock,
+        color: '#6C7382',
+        roughness: 0.9,
+        flatShading: true,
+      }),
+      0.92
+    ) as THREE.MeshStandardMaterial;
+    const baseDark = enableDiffuseRoughnessEon(
+      new THREE.MeshStandardMaterial({
+        map: atlas.craggyCaveRock,
+        color: '#464C59',
+        roughness: 0.94,
+        flatShading: true,
+      }),
+      0.94
+    ) as THREE.MeshStandardMaterial;
+
+    if (customCaveTex?.enabled && customCaveTex.textureId) {
+      applySurfaceTextureToMaterial(baseStone, customCaveTex, {
+        baseTintHex: '#8E96A6',
+        preserveFlatShading: true,
+      });
+      applySurfaceTextureToMaterial(baseDark, customCaveTex, {
+        baseTintHex: '#5E6573',
+        preserveFlatShading: true,
+      });
+      baseDark.color.multiplyScalar(0.76);
+    }
+
+    // Determine weathering either from Texture Studio Cave preset or painted terrain around this cave
+    let wPreset = customCaveTex?.enabled && customCaveTex.weathering ? customCaveTex.weathering : 'none';
+    let wIntensity = customCaveTex?.enabled ? customCaveTex.weatheringIntensity ?? 0.65 : 0.65;
+    if (wPreset === 'none') {
+      const tw = sampleTerrainWeathering(level.terrain, x, z);
+      const candidates: Array<{ p: 'moss' | 'cracked' | 'scorched' | 'muddy' | 'snow'; v: number }> = [
+        { p: 'cracked', v: tw.cracks },
+        { p: 'moss', v: tw.moss },
+        { p: 'scorched', v: tw.scorch },
+        { p: 'muddy', v: tw.mud },
+        { p: 'snow', v: tw.frost },
+      ];
+      let best = candidates[0];
+      for (const c of candidates) {
+        if (c.v > best.v) best = c;
+      }
+      if (best.v > 0.1) {
+        wPreset = best.p;
+        wIntensity = Math.min(1, best.v * 1.15);
+      }
+    }
+
+    if (wPreset === 'none') {
+      return { stone: baseStone as THREE.Material, dark: baseDark as THREE.Material };
+    }
+
+    const wrap = (src: THREE.MeshStandardMaterial, roughFallback: number): THREE.Material => {
+      const base = getSharedWeatheringBaseMaterial({
+        hasMap: Boolean(src.map),
+        doubleSide: src.side === THREE.DoubleSide,
+        transparent: src.transparent,
+        vertexColors: src.vertexColors,
+      });
+      const inst = createMaterialVariantInstance(base, {
+        colorHex: `#${src.color.getHexString()}`,
+        roughness: src.roughness ?? roughFallback,
+        metalness: src.metalness ?? 0.04,
+        diffuseRoughness: 0.92,
+        map: src.map ?? null,
+        normalMap: src.normalMap ?? null,
+        bumpMap: src.bumpMap ?? null,
+        bumpScale: src.bumpScale ?? 1,
+        weathering: wPreset,
+        weatheringIntensity: wIntensity,
+      });
+      src.dispose();
+      return inst;
+    };
+
+    return {
+      stone: wrap(baseStone, 0.9),
+      dark: wrap(baseDark, 0.94),
+    };
+  };
+
   const mossMat = enableDiffuseRoughnessEon(
     new THREE.MeshStandardMaterial({
       map: atlas.moss,
@@ -3496,10 +3672,12 @@ function buildCavesGroup(level: GameLevel, caves: CaveGrotto[]): THREE.Group {
     // Primary reachable Mountain-Base Cave with full enterable interior
     if (!builtMainMountainCave && Math.hypot(cave.x - MountainCave.x, cave.z - MountainCave.z) < 6) {
       builtMainMountainCave = true;
-      group.add(buildMountainCaveInterior(stoneMat, darkInteriorMat, mossMat, mossBrightMat));
+      const mats = resolveCaveMaterialPair(cave.x, cave.z);
+      group.add(buildMountainCaveInterior(mats.stone, mats.dark, mossMat, mossBrightMat));
       continue;
     }
 
+    const mats = resolveCaveMaterialPair(cave.x, cave.z);
     const y = sampleLevelHeight(level, cave.x, cave.z);
     const g = new THREE.Group();
     g.position.set(cave.x, y, cave.z);
@@ -3507,13 +3685,13 @@ function buildCavesGroup(level: GameLevel, caves: CaveGrotto[]): THREE.Group {
     g.scale.setScalar(cave.scale);
 
     const pillarGeo = createFacetedRockGeometry(1.45, 1.0, 1.0, 1.0, 31);
-    const leftP = new THREE.Mesh(pillarGeo, stoneMat);
+    const leftP = new THREE.Mesh(pillarGeo, mats.stone);
     leftP.scale.set(1.0, 1.8, 1.5);
     leftP.position.set(-1.65, 1.1, 0);
     leftP.castShadow = true;
     leftP.receiveShadow = true;
 
-    const rightP = new THREE.Mesh(pillarGeo, stoneMat);
+    const rightP = new THREE.Mesh(pillarGeo, mats.stone);
     rightP.scale.set(1.0, 1.8, 1.5);
     rightP.position.set(1.65, 1.1, 0);
     rightP.castShadow = true;
@@ -3521,7 +3699,7 @@ function buildCavesGroup(level: GameLevel, caves: CaveGrotto[]): THREE.Group {
 
     const arch = new THREE.Mesh(
       createFacetedRockGeometry(1.85, 1.0, 1.0, 1.0, 41),
-      stoneMat
+      mats.stone
     );
     arch.scale.set(1.65, 0.72, 1.55);
     arch.position.set(0, 2.75, -0.2);
@@ -3529,7 +3707,7 @@ function buildCavesGroup(level: GameLevel, caves: CaveGrotto[]): THREE.Group {
 
     const backWall = new THREE.Mesh(
       createFacetedRockGeometry(1.75, 1.0, 1.0, 1.0, 53),
-      darkInteriorMat
+      mats.dark
     );
     backWall.scale.set(1.45, 1.55, 0.85);
     backWall.position.set(0, 1.35, -1.65);
@@ -3551,7 +3729,8 @@ function buildCavesGroup(level: GameLevel, caves: CaveGrotto[]): THREE.Group {
 
   // Always ensure the primary enterable MountainCave is built on open-world islands
   if (!builtMainMountainCave) {
-    group.add(buildMountainCaveInterior(stoneMat, darkInteriorMat, mossMat, mossBrightMat));
+    const mats = resolveCaveMaterialPair(MountainCave.x, MountainCave.z);
+    group.add(buildMountainCaveInterior(mats.stone, mats.dark, mossMat, mossBrightMat));
   }
 
   return group;

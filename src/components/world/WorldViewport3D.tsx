@@ -86,6 +86,7 @@ const HEIGHT_MODIFYING_BRUSHES = new Set<TerrainBrush>([
   'plateauCliff',
   'carveRiver',
   'carveCave',
+  'weatherErode',
 ]);
 
 function getBrushAccentHex(brush: TerrainBrush): string {
@@ -104,6 +105,20 @@ function getBrushAccentHex(brush: TerrainBrush): string {
       return '#0EA5E9';
     case 'carveCave':
       return '#94A3B8';
+    case 'weatherMoss':
+      return '#4B8B3B';
+    case 'weatherCracks':
+      return '#78716C';
+    case 'weatherErode':
+      return '#D97706';
+    case 'weatherScorch':
+      return '#44403C';
+    case 'weatherMud':
+      return '#8B5E3C';
+    case 'weatherFrost':
+      return '#BAE6FD';
+    case 'weatherClear':
+      return '#E2E8F0';
     default:
       return '#F59E0B';
   }
@@ -138,6 +153,8 @@ interface WorldViewport3DProps {
   brush: TerrainBrush;
   brushRadius: number;
   brushFalloff?: TerrainBrushFalloff;
+  gridSnap?: 0 | 1 | 2;
+  isPlacingBuildingBlock?: boolean;
   resolutionScale?: ViewportResolutionScale;
   shadowQuality?: ViewportShadowQuality;
   addKindName?: string;
@@ -146,11 +163,11 @@ interface WorldViewport3DProps {
   renderPaused?: boolean;
   draggingFxTemplate?: { id: string; name: string; accentHex: string } | null;
   onSelectEntity: (id: string | null) => void;
-  onMoveEntity: (id: string, pos: { x: number; y: number }) => void;
+  onMoveEntity: (id: string, pos: { x: number; y: number }, elevationY?: number) => void;
   onRotateEntity: (id: string, deg: number) => void;
   onScaleEntity: (id: string, scale: number) => void;
   onBrushStroke: (x: number, z: number, meta?: TerrainBrushStrokeMeta) => void;
-  onAddAtPoint: (pos: { x: number; y: number }) => void;
+  onAddAtPoint: (pos: { x: number; y: number }, elevationY?: number) => void;
   onDropFxTemplate?: (templateId: string, pos: { x: number; y: number }) => void;
 }
 
@@ -164,6 +181,8 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
   brush,
   brushRadius,
   brushFalloff = 'smooth',
+  gridSnap = 0,
+  isPlacingBuildingBlock = false,
   resolutionScale = 1,
   shadowQuality = 'medium',
   fxBurstSignal = null,
@@ -221,6 +240,8 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
     brush,
     brushRadius,
     brushFalloff,
+    gridSnap,
+    isPlacingBuildingBlock,
     resolutionScale,
     shadowQuality,
     fxPaused,
@@ -243,6 +264,8 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
     brush,
     brushRadius,
     brushFalloff,
+    gridSnap,
+    isPlacingBuildingBlock,
     resolutionScale,
     shadowQuality,
     fxPaused,
@@ -280,8 +303,11 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
     dropPreviewGroup: THREE.Group;
     dropRingMat: THREE.MeshBasicMaterial;
     dropPillarMat: THREE.MeshBasicMaterial;
+    snapGhostGroup: THREE.Group;
+    buildGridHelper: THREE.GridHelper;
     entityGroups: Map<string, THREE.Group>;
     floatSpinObjects: THREE.Object3D[];
+    torchFlameObjects: Array<{ mesh: THREE.Object3D; baseY: number; phase: number }>;
     groundMeshes: THREE.Object3D[];
     heroGroup: THREE.Group | null;
     portalGroup: THREE.Group | null;
@@ -448,6 +474,40 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
     dropPreviewGroup.visible = false;
     scene.add(dropPreviewGroup);
 
+    // Modular 2m build snap grid & cursor block ghost
+    const buildGridHelper = new THREE.GridHelper(88, 44, '#7C5CFF', '#4B556B');
+    const gridMats = Array.isArray(buildGridHelper.material)
+      ? buildGridHelper.material
+      : [buildGridHelper.material];
+    for (const gm of gridMats) {
+      gm.transparent = true;
+      gm.opacity = 0.24;
+      gm.depthWrite = false;
+    }
+    buildGridHelper.position.y = 0.04;
+    buildGridHelper.visible = false;
+    scene.add(buildGridHelper);
+
+    const snapGhostGroup = new THREE.Group();
+    const ghostFloorMat = new THREE.MeshBasicMaterial({
+      color: '#38BDF8',
+      transparent: true,
+      opacity: 0.22,
+      side: THREE.DoubleSide,
+      depthWrite: false,
+    });
+    const ghostPlane = new THREE.Mesh(new THREE.PlaneGeometry(1.96, 1.96), ghostFloorMat);
+    ghostPlane.rotation.x = -Math.PI / 2;
+    ghostPlane.position.y = 0.03;
+    const ghostWire = new THREE.LineSegments(
+      new THREE.EdgesGeometry(new THREE.BoxGeometry(2.0, 2.0, 2.0)),
+      new THREE.LineBasicMaterial({ color: '#38BDF8', transparent: true, opacity: 0.72 })
+    );
+    ghostWire.position.y = 1.0;
+    snapGhostGroup.add(ghostPlane, ghostWire);
+    snapGhostGroup.visible = false;
+    scene.add(snapGhostGroup);
+
     sceneRefs.current = {
       scene,
       camera,
@@ -471,8 +531,11 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
       dropPreviewGroup,
       dropRingMat,
       dropPillarMat,
+      snapGhostGroup,
+      buildGridHelper,
       entityGroups: new Map(),
       floatSpinObjects: [],
+      torchFlameObjects: [],
       groundMeshes: [],
       heroGroup: null,
       portalGroup: null,
@@ -547,6 +610,68 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
       return hits[0]?.point ?? null;
     };
 
+    const raycastPlacementSurface = (
+      clientX: number,
+      clientY: number,
+      excludeEntityId?: string | null
+    ): { x: number; y: number; z: number; elevationY: number } | null => {
+      const refs = sceneRefs.current;
+      if (!refs || refs.groundMeshes.length === 0) return null;
+      const curLevel = propsRef.current.level;
+      const snap = propsRef.current.gridSnap ?? 0;
+      const shouldStack = Boolean(propsRef.current.isPlacingBuildingBlock || excludeEntityId);
+
+      updatePointer(clientX, clientY);
+      raycaster.setFromCamera(pointerNdc, camera);
+
+      let rawHit: THREE.Vector3 | null = null;
+      let stackedTopY: number | null = null;
+
+      if (shouldStack) {
+        const stackTargets: THREE.Object3D[] = [];
+        for (const ent of curLevel.entities) {
+          if (ent.id === excludeEntityId) continue;
+          if (!ent.buildingBlock && ent.kind !== 'platform') continue;
+          const grp = refs.entityGroups.get(ent.id);
+          if (grp) stackTargets.push(grp);
+        }
+        if (stackTargets.length > 0) {
+          const objHits = raycaster.intersectObjects(stackTargets, true);
+          const worldNormal = new THREE.Vector3();
+          for (const h of objHits) {
+            if (!h.face) continue;
+            worldNormal.copy(h.face.normal).transformDirection(h.object.matrixWorld);
+            if (worldNormal.y > 0.55) {
+              rawHit = h.point.clone();
+              stackedTopY = h.point.y;
+              break;
+            }
+          }
+        }
+      }
+
+      if (!rawHit) {
+        const groundHits = raycaster.intersectObjects(refs.groundMeshes, false);
+        rawHit = groundHits[0]?.point?.clone() ?? null;
+      }
+      if (!rawHit) return null;
+
+      const x = snap > 0 ? Math.round(rawHit.x / snap) * snap : rawHit.x;
+      const z = snap > 0 ? Math.round(rawHit.z / snap) * snap : rawHit.z;
+      const groundY = sampleLevelHeight(curLevel, x, z);
+      let elevationY = 0;
+      if (stackedTopY !== null) {
+        const rawElev = Math.max(0, stackedTopY - groundY);
+        // Quantize to clean masonry increments if very close to 2m or 0.24m
+        if (Math.abs(rawElev - Math.round(rawElev / 2) * 2) < 0.14) {
+          elevationY = Math.round(rawElev / 2) * 2;
+        } else {
+          elevationY = Number(rawElev.toFixed(2));
+        }
+      }
+      return { x, y: groundY + elevationY, z, elevationY };
+    };
+
     const raycastEntity = (clientX: number, clientY: number): string | null => {
       const refs = sceneRefs.current;
       if (!refs) return null;
@@ -586,7 +711,12 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
           isSculptDraggingRef.current = true;
           controls.enabled = false;
           strokeSampledHeight = sampleLevelHeight(curLevel, hit.x, hit.z);
-          strokeModifiedHeight = HEIGHT_MODIFYING_BRUSHES.has(curBrush);
+          const nearCaveForWeather =
+            curBrush.startsWith('weather') &&
+            (curLevel.terrain?.caves ?? []).some(
+              (c) => Math.hypot(hit.x - c.x, hit.z - c.z) < r + 15
+            );
+          strokeModifiedHeight = HEIGHT_MODIFYING_BRUSHES.has(curBrush) || nearCaveForWeather;
           lastSculptAreaRef.current = { x: hit.x, z: hit.z, radius: r };
           lastStrokeTimeMs = performance.now();
           propsRef.current.onBrushStroke(hit.x, hit.z, {
@@ -649,7 +779,13 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
             if (now - lastStrokeTimeMs >= 22) {
               lastStrokeTimeMs = now;
               lastSculptAreaRef.current = { x: hit.x, z: hit.z, radius: r };
-              if (HEIGHT_MODIFYING_BRUSHES.has(curBrush)) {
+              if (
+                HEIGHT_MODIFYING_BRUSHES.has(curBrush) ||
+                (curBrush.startsWith('weather') &&
+                  (propsRef.current.level.terrain?.caves ?? []).some(
+                    (c) => Math.hypot(hit.x - c.x, hit.z - c.z) < r + 15
+                  ))
+              ) {
                 strokeModifiedHeight = true;
               }
               propsRef.current.onBrushStroke(hit.x, hit.z, {
@@ -667,10 +803,25 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
       }
 
       if (activeMode === 'dragEntity' && activeEntityId) {
-        const hit = raycastGround(e.clientX, e.clientY);
-        if (hit) {
-          const bp = levelWorldToBoard(propsRef.current.level, hit.x, hit.z);
-          propsRef.current.onMoveEntity(activeEntityId, bp);
+        const draggedEnt = propsRef.current.level.entities.find((item) => item.id === activeEntityId);
+        const useSnapStack = Boolean(draggedEnt?.buildingBlock || draggedEnt?.kind === 'door' || (propsRef.current.gridSnap ?? 0) > 0);
+        if (useSnapStack) {
+          const hit = raycastPlacementSurface(
+            e.clientX,
+            e.clientY,
+            draggedEnt?.buildingBlock ? activeEntityId : null
+          );
+          if (hit) {
+            const bp = levelWorldToBoard(propsRef.current.level, hit.x, hit.z);
+            const keepElev = draggedEnt?.buildingBlock ? hit.elevationY : draggedEnt?.elevationY;
+            propsRef.current.onMoveEntity(activeEntityId, bp, keepElev);
+          }
+        } else {
+          const hit = raycastGround(e.clientX, e.clientY);
+          if (hit) {
+            const bp = levelWorldToBoard(propsRef.current.level, hit.x, hit.z);
+            propsRef.current.onMoveEntity(activeEntityId, bp);
+          }
         }
       } else if (activeMode === 'rotateEntity' && activeEntityId) {
         const dx = e.clientX - dragStartX;
@@ -679,6 +830,16 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
         const dx = e.clientX - dragStartX;
         const nextScale = Math.max(0.4, Math.min(2.6, startVal + dx * 0.008));
         propsRef.current.onScaleEntity(activeEntityId, Number(nextScale.toFixed(2)));
+      } else if (refs && curTool === 'add' && (propsRef.current.isPlacingBuildingBlock || (propsRef.current.gridSnap ?? 0) > 0)) {
+        const hit = raycastPlacementSurface(e.clientX, e.clientY, null);
+        if (hit) {
+          refs.snapGhostGroup.visible = true;
+          refs.snapGhostGroup.position.set(hit.x, hit.y, hit.z);
+        } else {
+          refs.snapGhostGroup.visible = false;
+        }
+      } else if (refs) {
+        refs.snapGhostGroup.visible = false;
       }
     };
 
@@ -687,6 +848,9 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
       activeMode = 'none';
       activeEntityId = null;
       controls.enabled = true;
+      if (sceneRefs.current) {
+        sceneRefs.current.snapGhostGroup.visible = false;
+      }
 
       if (wasMode === 'brush') {
         isSculptDraggingRef.current = false;
@@ -702,9 +866,12 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
       if (!movedFar && wasMode === 'none') {
         const { tool: curTool, level: curLevel } = propsRef.current;
         if (curTool === 'add') {
-          const hit = raycastGround(e.clientX, e.clientY);
+          const hit = raycastPlacementSurface(e.clientX, e.clientY, null);
           if (hit) {
-            propsRef.current.onAddAtPoint(levelWorldToBoard(curLevel, hit.x, hit.z));
+            propsRef.current.onAddAtPoint(
+              levelWorldToBoard(curLevel, hit.x, hit.z),
+              hit.elevationY > 0.01 ? hit.elevationY : undefined
+            );
           }
           return;
         }
@@ -715,10 +882,27 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
       }
     };
 
+    const onKeyDown = (e: KeyboardEvent) => {
+      const target = e.target as HTMLElement | null;
+      if (target && (target.tagName === 'INPUT' || target.tagName === 'TEXTAREA' || target.tagName === 'SELECT')) {
+        return;
+      }
+      if (e.key.toLowerCase() === 'r') {
+        const { selectedEntityID: selId, level: curLevel } = propsRef.current;
+        if (!selId) return;
+        const ent = curLevel.entities.find((item) => item.id === selId);
+        if (!ent) return;
+        const delta = e.shiftKey ? -90 : 90;
+        const nextRot = ((Math.round((ent.rotation ?? 0) / 90) * 90 + delta) + 360) % 360;
+        propsRef.current.onRotateEntity(selId, nextRot);
+      }
+    };
+
     let dom = renderer.domElement;
     dom.addEventListener('pointerdown', onPointerDown);
     window.addEventListener('pointermove', onPointerMove);
     window.addEventListener('pointerup', onPointerUp);
+    window.addEventListener('keydown', onKeyDown);
 
     let lastResizeW = container.clientWidth || 640;
     let lastResizeH = Math.max(1, container.clientHeight || 420);
@@ -861,6 +1045,22 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
         }
         for (let fi = 0; fi < refs.floatSpinObjects.length; fi++) {
           refs.floatSpinObjects[fi].rotation.y += dt * 1.4;
+        }
+        for (let ti = 0; ti < refs.torchFlameObjects.length; ti++) {
+          const tf = refs.torchFlameObjects[ti];
+          tf.mesh.position.y = tf.baseY + Math.sin(t * 9.2 + tf.phase) * 0.025;
+          const sc = 1 + Math.sin(t * 11 + tf.phase) * 0.14;
+          tf.mesh.scale.set(sc, 1 + Math.cos(t * 10 + tf.phase) * 0.18, sc);
+        }
+
+        // Show subtle build grid when Grid Snap is active & adding/building/moving blocks
+        const snap = propsRef.current.gridSnap ?? 0;
+        const showGrid =
+          snap > 0 &&
+          (propsRef.current.tool === 'add' || Boolean(propsRef.current.isPlacingBuildingBlock));
+        refs.buildGridHelper.visible = showGrid;
+        if (showGrid) {
+          refs.buildGridHelper.position.y = sampleLevelHeight(curLevel, 0, 0) + 0.04;
         }
 
         // Selection ring placement
@@ -1194,6 +1394,7 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
       dom.removeEventListener('pointerdown', onPointerDown);
       window.removeEventListener('pointermove', onPointerMove);
       window.removeEventListener('pointerup', onPointerUp);
+      window.removeEventListener('keydown', onKeyDown);
       controls.removeEventListener('change', saveCurrentCameraPose);
       controls.dispose();
       timer.dispose();
@@ -1529,7 +1730,7 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
         const [wx, wz] = levelBoardToWorld(level, ent.position);
         const wy = sampleLevelHeight(level, wx, wz);
         const extraY = ent.kind === 'platform' ? PlatformMotion.hover(ent.platformPreset) : 0;
-        grp.position.set(wx, wy + extraY, wz);
+        grp.position.set(wx, wy + extraY + (ent.elevationY ?? 0), wz);
 
         if (ent.kind !== 'fxEmitter' && ent.kind !== 'light') {
           const isMatte =
@@ -1562,6 +1763,7 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
     refs.entitiesContainer.clear();
     refs.entityGroups.clear();
     refs.floatSpinObjects = [];
+    refs.torchFlameObjects = [];
     refs.customUpdaters = [];
     refs.hasDynamicShadows = level.entities.some(
       (ent) => ent.kind === 'platform' && Boolean(ent.platformRunning)
@@ -1651,6 +1853,7 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
     const activeFxIds = new Set<string>();
     const deferredCanopyEntities: Array<{ ent: LevelEntity; anchor: THREE.Group }> = [];
     const deferredCustomEntities: Array<{ ent: LevelEntity; anchor: THREE.Group; isCached: boolean }> = [];
+    let wallTorchAddedLight = 0;
 
     for (const ent of level.entities) {
       if (ent.kind === 'fxEmitter') {
@@ -1666,7 +1869,7 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
         }
         const [wx, wz] = levelBoardToWorld(level, ent.position);
         const wy = sampleLevelHeight(level, wx, wz);
-        fx.group.position.set(wx, wy, wz);
+        fx.group.position.set(wx, wy + (ent.elevationY ?? 0), wz);
         fx.group.rotation.y = (ent.rotation * Math.PI) / 180;
         fx.group.scale.setScalar(ent.scale);
         refs.entityGroups.set(ent.id, fx.group);
@@ -1680,7 +1883,7 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
       if (ent.canopyTree) {
         const anchor = new THREE.Group();
         anchor.userData.entityId = ent.id;
-        anchor.position.set(wx, wy + extraY, wz);
+        anchor.position.set(wx, wy + extraY + (ent.elevationY ?? 0), wz);
         anchor.rotation.y = (ent.rotation * Math.PI) / 180;
         anchor.scale.setScalar(ent.scale);
         refs.entitiesContainer.add(anchor);
@@ -1692,7 +1895,7 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
       if (ent.customAssetId) {
         const anchor = new THREE.Group();
         anchor.userData.entityId = ent.id;
-        anchor.position.set(wx, wy + extraY, wz);
+        anchor.position.set(wx, wy + extraY + (ent.elevationY ?? 0), wz);
         const isCached = Boolean(getCachedAssetSync(ent.customAssetId));
         if (!isCached) {
           const fallbackMesh = buildEntityMesh(ent);
@@ -1726,12 +1929,25 @@ export const WorldViewport3D: React.FC<WorldViewport3DProps> = ({
         }
       }
 
-      mesh.position.set(wx, wy + extraY, wz);
+      mesh.position.set(wx, wy + extraY + (ent.elevationY ?? 0), wz);
       mesh.traverse((child) => {
         if (child.userData?.floatSpin) {
           refs.floatSpinObjects.push(child);
         }
+        if (child.userData?.torchFlame) {
+          refs.torchFlameObjects.push({
+            mesh: child,
+            baseY: Number(child.userData.baseY ?? child.position.y),
+            phase: wx * 0.43 + wz * 0.61,
+          });
+        }
       });
+      if (ent.buildingBlock?.shape === 'wallTorch' && wallTorchAddedLight < 8) {
+        wallTorchAddedLight++;
+        const pt = new THREE.PointLight('#FF9C40', 4.5, 11, 1.8);
+        pt.position.set(0, 1.82, 0.38);
+        mesh.add(pt);
+      }
       refs.entitiesContainer.add(mesh);
       refs.entityGroups.set(ent.id, mesh);
     }

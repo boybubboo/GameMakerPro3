@@ -8,6 +8,7 @@ import {
   Eye,
   EyeOff,
   GitBranch,
+  Hammer,
   Hand,
   Leaf,
   Paintbrush,
@@ -46,6 +47,7 @@ import {
   setupSceneEnvironment,
 } from '../../three/islandScene';
 import { buildEntityMesh } from '../../three/proceduralModels';
+import { WEATHERING_PRESETS } from '../../three/nodeMaterialUtils';
 import {
   applyVertexPaintDab,
   applyVertexPaintStrokesToObject,
@@ -117,9 +119,15 @@ const MODE_OPTIONS: {
     icon: <Sparkles size={13} />,
   },
   {
+    id: 'degrade',
+    label: 'Degrade',
+    desc: 'Chips, cracks, moss, scorch, rust',
+    icon: <Hammer size={13} />,
+  },
+  {
     id: 'erase',
     label: 'Erase',
-    desc: 'Restore original colors',
+    desc: 'Restore original colors & geometry',
     icon: <Eraser size={13} />,
   },
 ];
@@ -274,6 +282,8 @@ export const VertexPaintModal: React.FC<VertexPaintModalProps> = ({
     saturationShift: 0,
     valueShift: 0,
     hueJitter: 18,
+    degradeForm: 'cracked',
+    degradeChipDepth: 0.45,
   });
 
   const mountRef = useRef<HTMLDivElement | null>(null);
@@ -456,15 +466,21 @@ export const VertexPaintModal: React.FC<VertexPaintModalProps> = ({
     const refs = sceneRefs.current;
     if (!refs) return;
     refs.cursorGroup.scale.setScalar(brush.radius);
+    const degradeSwatch =
+      brush.mode === 'degrade'
+        ? WEATHERING_PRESETS.find((p) => p.id === (brush.degradeForm ?? 'cracked'))?.swatch ?? '#57534E'
+        : null;
     const colHex =
       brush.mode === 'erase'
         ? '#F8FAFC'
+        : degradeSwatch
+        ? degradeSwatch
         : brush.mode === 'hueShift'
         ? computeShiftedHexColor('#58D658', brush.hueShift, 0.2, 0.1)
         : effectivePreviewHex;
     (refs.cursorSphere.material as THREE.MeshBasicMaterial).color.set(colHex);
     (refs.cursorRing.material as THREE.MeshBasicMaterial).color.set(colHex);
-  }, [brush.radius, brush.mode, brush.hueShift, effectivePreviewHex]);
+  }, [brush.radius, brush.mode, brush.hueShift, brush.degradeForm, effectivePreviewHex]);
 
   // Sync OrbitControls mouse button mapping when toggling Paint vs Orbit mode
   useEffect(() => {
@@ -753,6 +769,12 @@ export const VertexPaintModal: React.FC<VertexPaintModalProps> = ({
           valueShift: activeStrokeBrush.valueShift,
           hueJitter: activeStrokeBrush.hueJitter,
           seed: activeStrokeSeed,
+          ...(activeStrokeBrush.mode === 'degrade'
+            ? {
+                degradeForm: activeStrokeBrush.degradeForm ?? 'cracked',
+                degradeChipDepth: activeStrokeBrush.degradeChipDepth ?? 0.45,
+              }
+            : {}),
         };
         commitStrokesRef.current([...strokesRef.current, newStroke], true);
       }
@@ -1031,10 +1053,10 @@ export const VertexPaintModal: React.FC<VertexPaintModalProps> = ({
             </div>
             <div className="min-w-0">
               <h2 className="text-sm sm:text-base font-black leading-tight truncate">
-                Object Vertex Painter
+                Object Painter &amp; Degrader
               </h2>
               <p className="text-[11px] font-semibold text-slate-500 dark:text-[#8E96AB] truncate">
-                Paint organic color &amp; hue variations directly onto leaves &amp; branches ·{' '}
+                Paint color, hue shifts &amp; surface degradation (chips, cracks, moss, scorch, rust) ·{' '}
                 <span className="text-[#7C5CFF] font-bold">{activeTargetLabel}</span>
               </p>
             </div>
@@ -1241,8 +1263,12 @@ export const VertexPaintModal: React.FC<VertexPaintModalProps> = ({
                         setInteractionTool('paint');
                       }}
                       className={`p-2 rounded-xl border text-left transition-colors ${
+                        m.id === 'degrade' ? 'col-span-2' : ''
+                      } ${
                         brush.mode === m.id
-                          ? 'bg-[#7C5CFF]/15 border-[#7C5CFF] text-[#7C5CFF]'
+                          ? m.id === 'degrade'
+                            ? 'bg-[#D97706]/15 border-[#D97706] text-[#D97706] dark:text-[#FBBF24]'
+                            : 'bg-[#7C5CFF]/15 border-[#7C5CFF] text-[#7C5CFF]'
                           : 'bg-white dark:bg-[#151923] border-slate-200/80 dark:border-white/[0.08] text-slate-700 dark:text-slate-300'
                       }`}
                     >
@@ -1294,8 +1320,60 @@ export const VertexPaintModal: React.FC<VertexPaintModalProps> = ({
                 />
               </div>
 
-              {/* 4. Color & Hue Shift Controls */}
-              {brush.mode !== 'erase' && (
+              {/* 4. Degrade & Weathering Controls */}
+              {brush.mode === 'degrade' && (
+                <div className="p-3 rounded-xl bg-slate-50 dark:bg-[#1B202C] border border-slate-200/70 dark:border-white/[0.07] space-y-3">
+                  <div className="flex items-center justify-between gap-2">
+                    <span className="text-[11px] font-extrabold uppercase tracking-wider text-slate-500 dark:text-[#8E96AB]">
+                      Degrade &amp; Weather Form
+                    </span>
+                    <span className="text-[10px] font-bold text-[#D97706] dark:text-[#FBBF24] capitalize">
+                      {WEATHERING_PRESETS.find((p) => p.id === (brush.degradeForm ?? 'cracked'))?.label ?? 'Cracked'}
+                    </span>
+                  </div>
+                  <div className="grid grid-cols-3 gap-1.5">
+                    {WEATHERING_PRESETS.filter((p) => p.id !== 'none').map((wp) => {
+                      const active = (brush.degradeForm ?? 'cracked') === wp.id;
+                      return (
+                        <button
+                          key={wp.id}
+                          type="button"
+                          title={wp.shortDesc}
+                          onClick={() => setBrush((b) => ({ ...b, degradeForm: wp.id }))}
+                          className={`flex items-center gap-1.5 py-1.5 px-2 rounded-xl text-[11px] font-bold border transition-colors ${
+                            active
+                              ? 'bg-[#D97706]/15 border-[#D97706] text-[#D97706] dark:text-[#FBBF24]'
+                              : 'bg-white dark:bg-[#151923] border-slate-200/80 dark:border-white/[0.08] text-slate-600 dark:text-slate-300'
+                          }`}
+                        >
+                          <span
+                            className="w-2.5 h-2.5 rounded-full border border-black/20 shrink-0"
+                            style={{ backgroundColor: wp.swatch }}
+                          />
+                          <span className="truncate">{wp.label}</span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                  {((brush.degradeForm ?? 'cracked') === 'chipped' ||
+                    (brush.degradeForm ?? 'cracked') === 'cracked') && (
+                    <BrushSlider
+                      label="Physical Chip / Dent Depth"
+                      value={brush.degradeChipDepth ?? 0.45}
+                      min={0}
+                      max={1}
+                      step={0.02}
+                      display={`${Math.round((brush.degradeChipDepth ?? 0.45) * 100)}%`}
+                      accent="#D97706"
+                      hint="Pushes & gouges subdivided stone, timber & mesh vertices inward for real organic dents."
+                      onChange={(v) => setBrush((b) => ({ ...b, degradeChipDepth: v }))}
+                    />
+                  )}
+                </div>
+              )}
+
+              {/* 5. Color & Hue Shift Controls */}
+              {brush.mode !== 'erase' && brush.mode !== 'degrade' && (
                 <div className="p-3 rounded-xl bg-slate-50 dark:bg-[#1B202C] border border-slate-200/70 dark:border-white/[0.07] space-y-3">
                   <div className="flex items-center justify-between gap-2">
                     <span className="text-[11px] font-extrabold uppercase tracking-wider text-slate-500 dark:text-[#8E96AB]">
@@ -1440,16 +1518,20 @@ export const VertexPaintModal: React.FC<VertexPaintModalProps> = ({
                 </div>
               )}
 
-              {/* 5. One-Click Organic Dapple Helper */}
+              {/* 6. One-Click Auto-Dapple / Auto-Degrade Helper */}
               <div className="p-3 rounded-xl bg-slate-50 dark:bg-[#1B202C] border border-slate-200/70 dark:border-white/[0.07] space-y-2">
                 <button
                   type="button"
                   onClick={handleAutoDapple}
-                  className="w-full py-2 px-3 rounded-xl bg-[#20B46A]/15 hover:bg-[#20B46A]/25 text-[#20B46A] text-xs font-extrabold inline-flex items-center justify-center gap-1.5 transition-colors"
+                  className={`w-full py-2 px-3 rounded-xl text-xs font-extrabold inline-flex items-center justify-center gap-1.5 transition-colors ${
+                    brush.mode === 'degrade'
+                      ? 'bg-[#D97706]/15 hover:bg-[#D97706]/25 text-[#D97706] dark:text-[#FBBF24]'
+                      : 'bg-[#20B46A]/15 hover:bg-[#20B46A]/25 text-[#20B46A]'
+                  }`}
                 >
                   <Wand2 size={13} />
                   <span>
-                    Auto-Dapple{' '}
+                    {brush.mode === 'degrade' ? 'Auto-Degrade' : 'Auto-Dapple'}{' '}
                     {brush.target === 'leaves'
                       ? 'Leaves'
                       : brush.target === 'branches'
@@ -1458,8 +1540,9 @@ export const VertexPaintModal: React.FC<VertexPaintModalProps> = ({
                   </span>
                 </button>
                 <p className="text-[10px] text-slate-400 dark:text-[#7D859B] leading-snug">
-                  Stamps soft non-repetitive painterly color patches using your current brush &amp;
-                  hue settings. Fully undoable!
+                  {brush.mode === 'degrade'
+                    ? 'Stamps organic weathering & surface wear patches using your active degrade form and strength. Fully undoable!'
+                    : 'Stamps soft non-repetitive painterly color patches using your current brush & hue settings. Fully undoable!'}
                 </p>
               </div>
             </div>

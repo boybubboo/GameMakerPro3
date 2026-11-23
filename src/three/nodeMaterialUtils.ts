@@ -25,6 +25,7 @@ import {
   min,
   mix,
   normalWorld,
+  positionLocal,
   positionWorld,
   pow,
   sin,
@@ -42,7 +43,33 @@ export const WEATHERING_TYPE_MAP: Record<WeatheringPreset, number> = {
   moss: 1,
   snow: 2,
   wet: 3,
+  cracked: 4,
+  chipped: 5,
+  scorched: 6,
+  muddy: 7,
+  bleached: 8,
+  rusted: 9,
 };
+
+export interface WeatheringPresetMeta {
+  id: WeatheringPreset;
+  label: string;
+  shortDesc: string;
+  swatch: string;
+}
+
+export const WEATHERING_PRESETS: WeatheringPresetMeta[] = [
+  { id: 'none', label: 'Clean', shortDesc: 'Pristine unweathered finish', swatch: '#CBD5E1' },
+  { id: 'moss', label: 'Moss', shortDesc: 'Lichen & mossy growth in crevices', swatch: '#4B8B3B' },
+  { id: 'cracked', label: 'Cracked', shortDesc: 'Fractured fissures & mineral grime', swatch: '#57534E' },
+  { id: 'chipped', label: 'Chipped', shortDesc: 'Worn edges, dents & exposed core', swatch: '#D6CFC2' },
+  { id: 'scorched', label: 'Scorched', shortDesc: 'Charred soot, ash & fire stain', swatch: '#292524' },
+  { id: 'muddy', label: 'Muddy', shortDesc: 'Damp earth splatters & bog rot', swatch: '#6B4C35' },
+  { id: 'bleached', label: 'Bleached', shortDesc: 'Sun-faded weathered wood & bone', swatch: '#DDD5C4' },
+  { id: 'rusted', label: 'Rusted', shortDesc: 'Oxidized patina & pitted flaking', swatch: '#A64B2A' },
+  { id: 'snow', label: 'Frost', shortDesc: 'Cold rime frost & snow dusting', swatch: '#E2EFFA' },
+  { id: 'wet', label: 'Wet', shortDesc: 'Rain-darkened slick surface sheen', swatch: '#3B6488' },
+];
 
 // Ensure r187's NodeMaterial.setDefaultValues + copy() never triggers the deprecated
 // `iridescenceThicknessRange` getter/setter warning on MeshPhysicalNodeMaterial clones.
@@ -356,11 +383,185 @@ export function safeMaterialReference<T>(property: string, inputType: string, fa
   return node;
 }
 
+function typeBandMask(uType: ReturnType<typeof float>, targetId: number) {
+  return step(targetId - 0.5, uType).mul(float(1.0).sub(step(targetId + 0.5, uType)));
+}
+
 /**
- * Reusable TSL Weathering shader fragment (`moss`, `snow`, `wet`, `none`) driven purely by
- * safe `materialReference('userData.uWeatherType', 'float')` and `materialReference('userData.uWeatherIntensity', 'float')`
- * so changing presets on `NodeMaterialInstance` updates uniforms in real time with ZERO recompilation,
- * and internal override materials (like ShadowMaterial) cleanly fall back to safe defaults.
+ * Shared TSL multi-form degradation & weathering blender.
+ * Evaluates procedural world-space cracks, chips, scorch soot, mud splatters, moss, frost,
+ * sun-bleached wear, rust patina, and wetness given normalized weights for each channel.
+ */
+export const applyDegradeLayersTsl = Fn(
+  ([
+    baseColor,
+    wMoss,
+    wCracks,
+    wChipped,
+    wScorch,
+    wMud,
+    wFrost,
+    wBleached,
+    wRusted,
+    wWet,
+  ]: [any, any, any, any, any, any, any, any, any, any]) => {
+    const wp = positionWorld;
+    const wnY = clamp(normalWorld.y, -1.0, 1.0);
+    const upFacing = smoothstep(0.12, 0.72, wnY);
+
+    // Multi-frequency deterministic 3D world-space pattern fields
+    const nA = sin(wp.x.mul(2.1).add(wp.z.mul(1.7))).mul(cos(wp.z.mul(2.4).sub(wp.y.mul(1.3))));
+    const nB = cos(wp.x.mul(5.3).sub(wp.z.mul(4.1)).add(wp.y.mul(3.2))).mul(0.5);
+    const nFine = sin(wp.x.mul(11.7).add(wp.y.mul(9.1)).sub(wp.z.mul(10.3))).mul(0.5).add(0.5);
+    const patchNoise = smoothstep(-0.35, 0.55, nA.add(nB));
+
+    // Ridged fracture / crack network lines in 3D space
+    const crackWave1 = abs(sin(wp.x.mul(4.7).add(nA.mul(1.8)).add(wp.y.mul(2.3))));
+    const crackWave2 = abs(cos(wp.z.mul(5.1).sub(nB.mul(2.1)).add(wp.y.mul(3.4))));
+    const crackNet = max(
+      pow(float(1.0).sub(clamp(crackWave1, 0.0, 1.0)), 7.0),
+      pow(float(1.0).sub(clamp(crackWave2, 0.0, 1.0)), 8.0)
+    );
+
+    // Chipping / edge wear speckles (sharp gouged highlights + shadowed pits)
+    const chipMask = smoothstep(0.56, 0.84, patchNoise.mul(0.62).add(nFine.mul(0.5)));
+    const chipPit = smoothstep(0.76, 0.94, nFine.mul(0.68).add(crackNet.mul(0.45)));
+
+    const out = vec3(baseColor).toVar('degradedRgb');
+
+    // 1. Moss & Lichen
+    const effMoss = clamp(upFacing.mul(0.65).add(0.35).mul(mix(0.45, 1.0, patchNoise)).mul(wMoss), 0.0, 0.94);
+    const mossCol = mix(vec3(0.14, 0.34, 0.12), vec3(0.32, 0.54, 0.2), patchNoise);
+    out.assign(mix(out, mossCol, effMoss));
+
+    // 2. Cracked (dark fissure veins + dusty aged rock tint)
+    const crackAmt = clamp(wCracks, 0.0, 1.0);
+    const agedDust = out.mul(0.78).add(vec3(0.11, 0.1, 0.09).mul(0.38));
+    out.assign(mix(out, agedDust, crackAmt.mul(0.42).mul(mix(0.5, 1.0, patchNoise))));
+    const fissure = clamp(crackNet.mul(1.35).add(nFine.mul(0.18)).mul(crackAmt), 0.0, 0.94);
+    out.assign(mix(out, vec3(0.06, 0.055, 0.05), fissure));
+
+    // 3. Chipped & Dented (exposed lighter inner stone/wood + dark gouge pits)
+    const chipAmt = clamp(wChipped, 0.0, 1.0);
+    const exposedCore = clamp(out.mul(1.28).add(vec3(0.18, 0.16, 0.14)), vec3(0.0), vec3(1.0));
+    out.assign(mix(out, exposedCore, chipMask.mul(chipAmt).mul(0.72)));
+    out.assign(mix(out, out.mul(0.34), chipPit.mul(chipAmt).mul(0.8)));
+
+    // 4. Scorched / Soot / Char
+    const scorchAmt = clamp(wScorch, 0.0, 1.0);
+    const sootPattern = clamp(patchNoise.mul(0.65).add(nFine.mul(0.45)), 0.0, 1.0);
+    const sootCol = mix(vec3(0.12, 0.08, 0.06), vec3(0.03, 0.028, 0.026), sootPattern);
+    out.assign(mix(out, sootCol, clamp(scorchAmt.mul(mix(0.62, 1.0, sootPattern)), 0.0, 0.96)));
+
+    // 5. Muddy / Damp Earth Rot
+    const mudAmt = clamp(wMud, 0.0, 1.0);
+    const mudPattern = smoothstep(0.2, 0.78, patchNoise.mul(0.7).add(nFine.mul(0.3)));
+    const mudCol = mix(vec3(0.18, 0.12, 0.07), vec3(0.31, 0.22, 0.13), nFine);
+    out.assign(mix(out, mudCol, clamp(mudAmt.mul(mix(0.45, 0.96, mudPattern)), 0.0, 0.92)));
+
+    // 6. Sun-Bleached / Dry Weathered Wood & Bone
+    const bleachAmt = clamp(wBleached, 0.0, 1.0);
+    const luma = dot(out, vec3(0.299, 0.587, 0.114));
+    const bleachedTone = mix(vec3(luma), vec3(0.74, 0.7, 0.63), 0.55).mul(float(0.95).add(nFine.mul(0.12)));
+    out.assign(mix(out, bleachedTone, clamp(bleachAmt.mul(mix(0.55, 0.95, patchNoise)), 0.0, 0.92)));
+
+    // 7. Rusted / Oxidized Patina
+    const rustAmt = clamp(wRusted, 0.0, 1.0);
+    const rustCol = mix(vec3(0.36, 0.14, 0.06), vec3(0.68, 0.29, 0.1), patchNoise.mul(0.7).add(nFine.mul(0.3)));
+    out.assign(mix(out, rustCol, clamp(rustAmt.mul(mix(0.45, 0.98, chipMask.max(patchNoise.mul(0.65)))), 0.0, 0.94)));
+
+    // 8. Snow / Rime Frost
+    const snowMask = smoothstep(0.14, 0.6, wnY.add(patchNoise.sub(0.5).mul(0.32))).mul(wFrost);
+    const snowCol = mix(vec3(0.8, 0.88, 0.96), vec3(0.97, 0.99, 1.0), upFacing);
+    out.assign(mix(out, snowCol, clamp(snowMask.mul(0.95), 0.0, 0.96)));
+
+    // 9. Wet Sheen (darkened saturated albedo)
+    const wetMask = clamp(wWet.mul(0.85), 0.0, 0.95);
+    out.assign(mix(out, out.mul(0.56), wetMask));
+
+    return out;
+  }
+);
+
+export const applyDegradeRoughnessTsl = Fn(
+  ([baseRough, wMoss, wCracks, wChipped, wScorch, wMud, wFrost, wBleached, wRusted, wWet]: [
+    any,
+    any,
+    any,
+    any,
+    any,
+    any,
+    any,
+    any,
+    any,
+    any,
+  ]) => {
+    const wnY = clamp(normalWorld.y, -1.0, 1.0);
+    const upFacing = smoothstep(0.18, 0.68, wnY);
+    const r = float(baseRough).toVar('degradeRough');
+    r.assign(mix(r, max(r, 0.92), clamp(wMoss.mul(upFacing), 0.0, 1.0)));
+    r.assign(mix(r, max(r, 0.94), clamp(wCracks.add(wChipped).mul(0.85), 0.0, 1.0)));
+    r.assign(mix(r, float(0.97), clamp(wScorch, 0.0, 1.0)));
+    r.assign(mix(r, float(0.95), clamp(wBleached, 0.0, 1.0)));
+    r.assign(mix(r, float(0.88), clamp(wRusted, 0.0, 1.0)));
+    r.assign(mix(r, float(0.34), clamp(wMud.mul(0.8), 0.0, 0.9)));
+    r.assign(mix(r, float(0.42), clamp(wFrost.mul(upFacing).mul(0.85), 0.0, 0.9)));
+    r.assign(mix(r, float(0.11), clamp(wWet.mul(0.95), 0.0, 0.95)));
+    return clamp(r, 0.05, 1.0);
+  }
+);
+
+/**
+ * Local-space procedural dings, edge chips, and directional surface scratches driven by `wearFactor` (0..1).
+ * Uses `positionLocal` so scratches and impact dings stay locked onto each block when moved or rotated.
+ */
+export const applyWearDingsScratchesTsl = Fn(([baseColor, wearAmt]: [any, any]) => {
+  const out = vec3(baseColor).toVar('wearRgb');
+  const w = clamp(wearAmt, 0.0, 1.0);
+
+  If(w.greaterThan(0.005), () => {
+    const lp = positionLocal;
+    const warp = sin(lp.x.mul(5.3).add(lp.z.mul(4.1))).mul(cos(lp.y.mul(4.7).sub(lp.x.mul(3.1))));
+    const fineNoise = sin(lp.x.mul(17.3).add(lp.y.mul(13.7)).sub(lp.z.mul(15.9))).mul(0.5).add(0.5);
+
+    // Directional scratches (density & width expand continuously as w increases)
+    const diagA = lp.x.mul(13.5).add(lp.y.mul(22.0)).add(lp.z.mul(6.5)).add(warp.mul(1.8));
+    const diagB = lp.z.mul(15.0).sub(lp.y.mul(18.5)).add(lp.x.mul(7.0)).sub(warp.mul(1.6));
+    const sLineA = float(1.0).sub(abs(sin(diagA)));
+    const sLineB = float(1.0).sub(abs(cos(diagB)));
+    const sGateA = smoothstep(0.15, 0.72, sin(lp.x.mul(3.1).sub(lp.z.mul(2.7)).add(1.2)).mul(0.5).add(0.5));
+    const sGateB = smoothstep(0.2, 0.78, cos(lp.y.mul(3.6).add(lp.z.mul(2.9))).mul(0.5).add(0.5));
+
+    const scratchThresh = mix(0.96, 0.78, w);
+    const scratchHit = max(
+      smoothstep(scratchThresh, 0.996, sLineA).mul(sGateA),
+      smoothstep(scratchThresh, 0.996, sLineB).mul(sGateB)
+    );
+    const scratchHighlight = smoothstep(mix(0.92, 0.72, w), 0.985, max(sLineA.mul(sGateA), sLineB.mul(sGateB))).mul(0.5);
+
+    // Clustered impact dings & chipped divots
+    const dingField = sin(lp.x.mul(7.2).add(0.5))
+      .mul(cos(lp.z.mul(6.8).sub(0.8)))
+      .mul(0.55)
+      .add(sin(lp.y.mul(9.1).add(lp.x.mul(4.3))).mul(0.45));
+    const dingMask = smoothstep(mix(0.76, 0.24, w), mix(0.92, 0.56, w), dingField.mul(0.5).add(0.5));
+    const dingCore = smoothstep(mix(0.86, 0.48, w), 0.96, dingField.mul(0.5).add(0.5).mul(0.75).add(fineNoise.mul(0.25)));
+
+    // Exposed scuffed core + dark deep groove/pit shadowing
+    const exposedCore = clamp(out.mul(1.24).add(vec3(0.16, 0.14, 0.12)), vec3(0.0), vec3(1.0));
+    const darkGroove = out.mul(mix(0.48, 0.22, w));
+
+    out.assign(mix(out, exposedCore, clamp(dingMask.mul(0.52).add(scratchHighlight.mul(0.65)).mul(w), 0.0, 0.85)));
+    out.assign(mix(out, darkGroove, clamp(dingCore.mul(0.78).add(scratchHit.mul(0.92)).mul(mix(0.45, 1.0, w)), 0.0, 0.92)));
+  });
+
+  return out;
+});
+
+/**
+ * Reusable TSL Weathering shader fragment (`moss`, `snow`, `wet`, `cracked`, `chipped`,
+ * `scorched`, `muddy`, `bleached`, `rusted`, `none`) + universal `uWearFactor` dings & scratches
+ * driven purely by safe `materialReference` uniforms so sliders update in real time with ZERO recompilation.
  */
 export function buildWeatheringColorTsl(baseRgbNode: unknown) {
   return Fn(() => {
@@ -368,41 +569,25 @@ export function buildWeatheringColorTsl(baseRgbNode: unknown) {
     const uTintMix = safeMaterialReference('userData.uTintMix', 'float', 0) as unknown as ReturnType<typeof float>;
     const uWeatherType = safeMaterialReference('userData.uWeatherType', 'float', 0) as unknown as ReturnType<typeof float>;
     const uWeatherIntensity = safeMaterialReference('userData.uWeatherIntensity', 'float', 0) as unknown as ReturnType<typeof float>;
-
-    const wp = positionWorld;
-    const wnY = clamp(normalWorld.y, -1.0, 1.0);
-    const upFacing = smoothstep(0.12, 0.72, wnY);
-
-    // Deterministic micro noise in world space for organic moss/frost patches
-    const nA = sin(wp.x.mul(2.1).add(wp.z.mul(1.7))).mul(cos(wp.z.mul(2.4).sub(wp.y.mul(1.3))));
-    const nB = cos(wp.x.mul(5.3).sub(wp.z.mul(4.1))).mul(0.5);
-    const patchNoise = smoothstep(-0.35, 0.55, nA.add(nB));
+    const uWearFactor = safeMaterialReference('userData.uWearFactor', 'float', 0) as unknown as ReturnType<typeof float>;
 
     const baseRgb = vec3(baseRgbNode as THREE.Vector3);
-    const tinted = mix(baseRgb, baseRgb.mul(vec3(uTintColor)), clamp(uTintMix, 0.0, 1.0)).toVar();
+    const tinted = mix(baseRgb, baseRgb.mul(vec3(uTintColor)), clamp(uTintMix, 0.0, 1.0));
+    const amt = clamp(uWeatherIntensity, 0.0, 1.0);
 
-    // Weather 1 = Moss (velvety woodland moss clinging onto upward and shadowed crevices)
-    const isMoss = step(0.5, uWeatherType).mul(float(1.0).sub(step(1.5, uWeatherType)));
-    const mossMask = clamp(upFacing.mul(0.75).add(0.25).mul(mix(0.45, 1.0, patchNoise)), 0.0, 1.0)
-      .mul(uWeatherIntensity)
-      .mul(isMoss);
-    const mossCol = mix(vec3(0.16, 0.38, 0.14), vec3(0.28, 0.52, 0.2), patchNoise);
-    tinted.assign(mix(tinted, mossCol, clamp(mossMask.mul(0.88), 0.0, 0.92)));
-
-    // Weather 2 = Snow (crisp frosty mantle on upper surfaces)
-    const isSnow = step(1.5, uWeatherType).mul(float(1.0).sub(step(2.5, uWeatherType)));
-    const snowMask = smoothstep(0.18, 0.62, wnY.add(patchNoise.sub(0.5).mul(0.28)))
-      .mul(uWeatherIntensity)
-      .mul(isSnow);
-    const snowCol = mix(vec3(0.82, 0.89, 0.96), vec3(0.96, 0.98, 1.0), upFacing);
-    tinted.assign(mix(tinted, snowCol, clamp(snowMask.mul(0.95), 0.0, 0.96)));
-
-    // Weather 3 = Wet (darkened albedo saturation as if rained on)
-    const isWet = step(2.5, uWeatherType);
-    const wetMask = clamp(uWeatherIntensity.mul(0.85), 0.0, 0.95).mul(isWet);
-    tinted.assign(mix(tinted, tinted.mul(0.56), wetMask));
-
-    return tinted;
+    const weathered = applyDegradeLayersTsl(
+      tinted,
+      typeBandMask(uWeatherType, 1).mul(amt),
+      typeBandMask(uWeatherType, 4).mul(amt),
+      typeBandMask(uWeatherType, 5).mul(amt),
+      typeBandMask(uWeatherType, 6).mul(amt),
+      typeBandMask(uWeatherType, 7).mul(amt),
+      typeBandMask(uWeatherType, 2).mul(amt),
+      typeBandMask(uWeatherType, 8).mul(amt),
+      typeBandMask(uWeatherType, 9).mul(amt),
+      typeBandMask(uWeatherType, 3).mul(amt)
+    );
+    return applyWearDingsScratchesTsl(weathered, clamp(uWearFactor, 0.0, 1.0));
   })();
 }
 
@@ -410,19 +595,22 @@ export function buildWeatheringRoughnessTsl() {
   return Fn(() => {
     const uWeatherType = safeMaterialReference('userData.uWeatherType', 'float', 0) as unknown as ReturnType<typeof float>;
     const uWeatherIntensity = safeMaterialReference('userData.uWeatherIntensity', 'float', 0) as unknown as ReturnType<typeof float>;
-    const baseRough = materialRoughness;
-    const wnY = clamp(normalWorld.y, -1.0, 1.0);
-    const upFacing = smoothstep(0.18, 0.68, wnY);
+    const uWearFactor = safeMaterialReference('userData.uWearFactor', 'float', 0) as unknown as ReturnType<typeof float>;
+    const amt = clamp(uWeatherIntensity, 0.0, 1.0);
 
-    const isMoss = step(0.5, uWeatherType).mul(float(1.0).sub(step(1.5, uWeatherType)));
-    const isSnow = step(1.5, uWeatherType).mul(float(1.0).sub(step(2.5, uWeatherType)));
-    const isWet = step(2.5, uWeatherType);
-
-    const r = baseRough.toVar();
-    r.assign(mix(r, max(r, 0.9), isMoss.mul(uWeatherIntensity).mul(upFacing)));
-    r.assign(mix(r, float(0.45), isSnow.mul(uWeatherIntensity).mul(upFacing).mul(0.8)));
-    r.assign(mix(r, float(0.11), isWet.mul(clamp(uWeatherIntensity.mul(0.95), 0.0, 0.95))));
-    return clamp(r, 0.05, 1.0);
+    const degR = applyDegradeRoughnessTsl(
+      materialRoughness,
+      typeBandMask(uWeatherType, 1).mul(amt),
+      typeBandMask(uWeatherType, 4).mul(amt),
+      typeBandMask(uWeatherType, 5).mul(amt),
+      typeBandMask(uWeatherType, 6).mul(amt),
+      typeBandMask(uWeatherType, 7).mul(amt),
+      typeBandMask(uWeatherType, 2).mul(amt),
+      typeBandMask(uWeatherType, 8).mul(amt),
+      typeBandMask(uWeatherType, 9).mul(amt),
+      typeBandMask(uWeatherType, 3).mul(amt)
+    );
+    return mix(degR, max(degR, 0.94), clamp(uWearFactor.mul(0.8), 0.0, 1.0));
   })();
 }
 
@@ -433,6 +621,7 @@ export function applyWeatheringUserData(
     tintMix?: number;
     weathering?: WeatheringPreset;
     weatheringIntensity?: number;
+    wearFactor?: number;
   }
 ) {
   if (!(targetUserData.uTintColor instanceof THREE.Color)) {
@@ -457,6 +646,11 @@ export function applyWeatheringUserData(
     targetUserData.uWeatherIntensity = THREE.MathUtils.clamp(opts.weatheringIntensity, 0, 1);
   } else if (typeof targetUserData.uWeatherIntensity !== 'number') {
     targetUserData.uWeatherIntensity = 0.65;
+  }
+  if (typeof opts?.wearFactor === 'number') {
+    targetUserData.uWearFactor = THREE.MathUtils.clamp(opts.wearFactor, 0, 1);
+  } else if (typeof targetUserData.uWearFactor !== 'number') {
+    targetUserData.uWearFactor = 0;
   }
 }
 
@@ -510,6 +704,7 @@ export function getSharedWeatheringBaseMaterial(opts: VariantBaseOptions = {}): 
     tintMix: 0,
     weathering: 'none',
     weatheringIntensity: 0.65,
+    wearFactor: 0,
   });
   base.needsUpdate = true;
   variantBaseCache.set(key, base);
@@ -531,6 +726,7 @@ export function createMaterialVariantInstance(
     diffuseRoughness?: number;
     weathering?: WeatheringPreset;
     weatheringIntensity?: number;
+    wearFactor?: number;
     map?: THREE.Texture | null;
     normalMap?: THREE.Texture | null;
     normalScale?: number;
@@ -571,6 +767,7 @@ export function createMaterialVariantInstance(
     tintMix: init?.tintMix,
     weathering: init?.weathering,
     weatheringIntensity: init?.weatheringIntensity,
+    wearFactor: init?.wearFactor,
   });
   return inst;
 }
@@ -589,6 +786,7 @@ export function updateMaterialVariantInstance(
     diffuseRoughness?: number;
     weathering?: WeatheringPreset;
     weatheringIntensity?: number;
+    wearFactor?: number;
   }
 ) {
   const m = mat as unknown as {
@@ -613,13 +811,139 @@ export function updateMaterialVariantInstance(
     tintMix: variant.tintMix,
     weathering: variant.weathering,
     weatheringIntensity: variant.weatheringIntensity,
+    wearFactor: variant.wearFactor,
+  });
+}
+
+/**
+ * Dynamically applies or removes watertight physical vertex dings, edge chips, and denting
+ * across an entity's subdivided meshes based on `wearFactor` (0..1).
+ * Coincident corner/edge vertices share a smooth averaged normal so BoxGeometries never tear.
+ */
+export function applyObjectWearDeformation(root: THREE.Object3D, wearFactor: number): void {
+  const clamped = THREE.MathUtils.clamp(wearFactor, 0, 1);
+  const prevApplied = root.userData.__appliedWearFactor as number | undefined;
+  if (prevApplied !== undefined && Math.abs(prevApplied - clamped) < 0.002) {
+    return;
+  }
+  if (prevApplied === undefined && clamped <= 0.002) {
+    root.userData.__appliedWearFactor = 0;
+    return;
+  }
+  root.userData.__appliedWearFactor = clamped;
+
+  const seenGeos = new Set<THREE.BufferGeometry>();
+
+  root.traverse((obj) => {
+    if (!(obj instanceof THREE.Mesh)) return;
+    if (obj instanceof THREE.InstancedMesh || obj instanceof THREE.SkinnedMesh) return;
+    if (obj.userData.noVertexPaint || obj.userData.floatSpin || obj.userData.puzzleCore) return;
+
+    let geo = obj.geometry;
+    if (seenGeos.has(geo)) {
+      geo = geo.clone();
+      obj.geometry = geo;
+    }
+    seenGeos.add(geo);
+
+    const pos = geo.attributes.position as THREE.BufferAttribute | undefined;
+    if (!pos || pos.count < 16 || !(pos.array instanceof Float32Array)) return;
+
+    if (!geo.attributes.normal) {
+      geo.computeVertexNormals();
+    }
+    const norm = geo.attributes.normal as THREE.BufferAttribute | undefined;
+    if (!norm || !(norm.array instanceof Float32Array)) return;
+
+    let basePos = geo.userData.wearBasePositions as Float32Array | undefined;
+    let baseNorm = geo.userData.wearBaseNormals as Float32Array | undefined;
+    let smoothNorm = geo.userData.wearSmoothNormals as Float32Array | undefined;
+    let geoScale = geo.userData.wearGeoScale as number | undefined;
+
+    if (!basePos || basePos.length !== pos.array.length) {
+      basePos = new Float32Array(pos.array);
+      baseNorm = new Float32Array(norm.array);
+      geo.computeBoundingSphere();
+      geoScale = Math.max(0.45, geo.boundingSphere?.radius ?? 1.0);
+
+      // Accumulate smooth watertight normals per unique spatial vertex position
+      const acc = new Map<string, [number, number, number]>();
+      for (let i = 0; i < pos.count; i++) {
+        const i3 = i * 3;
+        const key = `${Math.round(basePos[i3] * 500)},${Math.round(basePos[i3 + 1] * 500)},${Math.round(basePos[i3 + 2] * 500)}`;
+        const entry = acc.get(key);
+        if (entry) {
+          entry[0] += baseNorm[i3];
+          entry[1] += baseNorm[i3 + 1];
+          entry[2] += baseNorm[i3 + 2];
+        } else {
+          acc.set(key, [baseNorm[i3], baseNorm[i3 + 1], baseNorm[i3 + 2]]);
+        }
+      }
+      smoothNorm = new Float32Array(pos.array.length);
+      for (let i = 0; i < pos.count; i++) {
+        const i3 = i * 3;
+        const key = `${Math.round(basePos[i3] * 500)},${Math.round(basePos[i3 + 1] * 500)},${Math.round(basePos[i3 + 2] * 500)}`;
+        const sum = acc.get(key)!;
+        const len = Math.hypot(sum[0], sum[1], sum[2]) || 1;
+        smoothNorm[i3] = sum[0] / len;
+        smoothNorm[i3 + 1] = sum[1] / len;
+        smoothNorm[i3 + 2] = sum[2] / len;
+      }
+
+      geo.userData.wearBasePositions = basePos;
+      geo.userData.wearBaseNormals = baseNorm;
+      geo.userData.wearSmoothNormals = smoothNorm;
+      geo.userData.wearGeoScale = geoScale;
+    }
+
+    if (clamped <= 0.002) {
+      pos.array.set(basePos);
+      if (baseNorm) norm.array.set(baseNorm);
+      pos.needsUpdate = true;
+      norm.needsUpdate = true;
+      return;
+    }
+
+    const pArr = pos.array as Float32Array;
+    const sArr = smoothNorm!;
+    const maxDent = Math.min(0.11, (geoScale ?? 1.0) * 0.068) * clamped;
+    const invScale = 1.0 / Math.max(0.35, (geoScale ?? 1.0) * 0.55);
+
+    for (let i = 0; i < pos.count; i++) {
+      const i3 = i * 3;
+      const vx = basePos[i3];
+      const vy = basePos[i3 + 1];
+      const vz = basePos[i3 + 2];
+      const sx = vx * invScale;
+      const sy = vy * invScale;
+      const sz = vz * invScale;
+
+      // Multi-pocket impact dings + diagonal scratch gouges (same inputs for shared corners)
+      const dingWave =
+        Math.sin(sx * 4.3 + sy * 2.1) * Math.cos(sz * 4.7 - sy * 1.9) * 0.6 +
+        Math.sin(sx * 8.9 - sz * 7.3 + sy * 5.1) * 0.4;
+      const pocket = Math.max(0, dingWave * 0.5 + 0.5 - (0.72 - clamped * 0.34));
+      const gougeLine = Math.max(
+        0,
+        Math.abs(Math.sin(sx * 6.5 + sy * 9.5 + sz * 3.1)) - (0.94 - clamped * 0.14)
+      );
+      const disp = Math.min(1.0, pocket * 2.6 + gougeLine * 3.2) * maxDent;
+
+      pArr[i3] = vx - sArr[i3] * disp;
+      pArr[i3 + 1] = vy - sArr[i3 + 1] * disp;
+      pArr[i3 + 2] = vz - sArr[i3 + 2] * disp;
+    }
+
+    pos.needsUpdate = true;
+    geo.computeVertexNormals();
   });
 }
 
 /**
  * Wraps every opaque/standard mesh inside an entity's 3D hierarchy into a shared-shader
- * `NodeMaterialInstance` so per-entity color, roughness, EON `diffuseRoughness`, and
- * weathering presets (`moss`, `snow`, `wet`) update live via uniforms without recompiling shaders!
+ * `NodeMaterialInstance` so per-entity color, roughness, EON `diffuseRoughness`,
+ * weathering presets, and `wearFactor` (dings & scratches) update live via uniforms without recompiling shaders!
  * Snapshot original defaults into `userData.__baseVariantDefaults` so resetting returns cleanly.
  */
 export function applyEntityMaterialVariant(
@@ -627,11 +951,13 @@ export function applyEntityMaterialVariant(
   variant?: EntityMaterialVariant,
   isMatteEntity = true
 ): void {
+  const wearAmt = typeof variant?.wearFactor === 'number' ? THREE.MathUtils.clamp(variant.wearFactor, 0, 1) : 0;
   const hasVariant = Boolean(
     variant &&
       (variant.colorHex ||
         typeof variant.roughness === 'number' ||
         typeof variant.diffuseRoughness === 'number' ||
+        wearAmt > 0.001 ||
         (variant.weathering && variant.weathering !== 'none'))
   );
 
@@ -666,6 +992,8 @@ export function applyEntityMaterialVariant(
       oldMat.dispose();
     }
   });
+
+  applyObjectWearDeformation(root, wearAmt);
 }
 
 function wrapSingleEntityMaterial(
@@ -676,6 +1004,18 @@ function wrapSingleEntityMaterial(
 ): THREE.Material {
   // Never disturb custom particle / unlit glow materials or already-toon materials unless explicitly overridden
   if ((mat as THREE.MeshBasicMaterial).isMeshBasicMaterial && !hasVariant) return mat;
+
+  // Canopy Engine trees already carry their own wind + weathering/wear TSL graph
+  if (mat.userData?.__canopyWeatherReady) {
+    applyWeatheringUserData(mat.userData, {
+      tintHex: variant?.colorHex ?? '#ffffff',
+      tintMix: variant?.colorHex ? 0.82 : 0,
+      weathering: variant?.weathering ?? 'none',
+      weatheringIntensity: variant?.weatheringIntensity ?? 0.65,
+      wearFactor: variant?.wearFactor ?? 0,
+    });
+    return mat;
+  }
 
   // Already wrapped into our variant-aware NodeMaterialInstance (or concrete MeshPhysicalNodeMaterial for meshlets)
   if (mat.userData?.__variantWrapped) {
@@ -715,6 +1055,7 @@ function wrapSingleEntityMaterial(
     transparent: mat.transparent,
     weathering: 'none',
     weatheringIntensity: 0.65,
+    wearFactor: 0,
   });
 
   inst.name = mat.name;
@@ -755,6 +1096,7 @@ function applyVariantToWrappedMaterial(mat: THREE.Material, variant?: EntityMate
         : defaults.diffuseRoughness,
     weathering: variant?.weathering ?? 'none',
     weatheringIntensity: variant?.weatheringIntensity ?? 0.65,
+    wearFactor: variant?.wearFactor ?? 0,
   });
 }
 

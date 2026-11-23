@@ -4,11 +4,13 @@ import type {
   BehaviorCard,
   BindableStat,
   BiomeId,
+  BuildingBlockConfig,
   CameraMode,
   CharacterAction,
   ClauseDefinition,
   CompleteCondition,
   CraftingRecipe,
+  DoorConfig,
   EntityKind,
   EntitySection,
   EnvironmentType,
@@ -52,6 +54,7 @@ import {
   DrivingWaypoints,
   fromMountainCaveLocal,
   IslandTerrain,
+  levelWorldToBoard,
   RiverCrossing,
   uid,
 } from '../utils/terrain';
@@ -936,6 +939,21 @@ export const TemplateLibrary: GameTemplate[] = [
     prototypeType: 'Dungeon Crawler',
     biomeLabel: 'Underground',
     highlights: ['Stone chambers & cave grottos', 'Torch puzzles & traps', 'Vault treasures'],
+  },
+  {
+    id: 'dungeonBuilder',
+    name: 'Dungeon Builder',
+    symbol: 'cube.fill',
+    colorHex: '#F59E0B',
+    blurb: 'Modular masonry sandbox with snap-grid stone walls, multi-style animated doors, stairs, mezzanines & torches.',
+    category: 'worlds',
+    prototypeType: 'Modular Builder',
+    biomeLabel: 'Stone Keep & Crypt',
+    highlights: [
+      '10 snap-grid masonry & cabin shapes + wear/moss weathering',
+      'Sliding iron-bar gate, double split door & interactive trapdoor',
+      'Walkable straight & spiral stairs leading to a 2m upper mezzanine',
+    ],
   },
   {
     id: 'scifi',
@@ -2739,6 +2757,225 @@ function buildRoguelikeProject(name: string): GameProject {
   };
 }
 
+function buildDungeonBuilderProject(name: string): GameProject {
+  const crypt: GameLevel = {
+    ...createBlankLevel('Crypt Keep · Floor 1', 'cave', 'dungeon'),
+    style: 'roomChain',
+    environmentType: 'dungeon',
+    visualStyle: 'painterlyPBR',
+    cameraMode: 'chase',
+    biome: 'cave',
+    sky: 'cave',
+    sunAngle: 32,
+    fog: 0.34,
+    weather: 'none',
+    vistaPreset: 'none',
+    canSwim: false,
+    completeCondition: 'reachPortal',
+    audio: defaultLevelAudio('tense'),
+    notes: 'Starter dungeon chamber built on the 2m snap grid with modular masonry blocks, stairs, torches, and animated doors.',
+  };
+
+  const at = (wx: number, wz: number) => levelWorldToBoard(crypt, wx, wz);
+  const block = (
+    nameLabel: string,
+    wx: number,
+    wz: number,
+    bb: BuildingBlockConfig,
+    opts: Partial<LevelEntity> = {}
+  ): LevelEntity => {
+    const bp = at(wx, wz);
+    return createEntity(bb.shape === 'wallTorch' ? 'light' : 'prop', nameLabel, bp.x, bp.y, {
+      buildingBlock: bb,
+      ...opts,
+    });
+  };
+  const modDoor = (
+    nameLabel: string,
+    wx: number,
+    wz: number,
+    dc: DoorConfig,
+    opts: Partial<LevelEntity> = {}
+  ): LevelEntity => {
+    const bp = at(wx, wz);
+    return createEntity('door', nameLabel, bp.x, bp.y, {
+      doorConfig: dc,
+      ...opts,
+    });
+  };
+
+  const entities: LevelEntity[] = [];
+
+  // Courtyard stone flagstone & cobble floor grid (x: -4..4, z: -4..4, 2m tiles)
+  for (let gx = -4; gx <= 4; gx += 2) {
+    for (let gz = -4; gz <= 4; gz += 2) {
+      // Leave pit gap under trapdoor tile at (2, 2)
+      if (gx === 2 && gz === 2) continue;
+      const isCenterCross = gx === 0 || gz === 0;
+      const worn = (gx + gz) % 4 === 0;
+      entities.push(
+        block(
+          isCenterCross ? 'Flagstone Floor' : 'Cobble Floor',
+          gx,
+          gz,
+          { shape: 'floorTile', material: isCenterCross ? 'squareFlagstone' : 'randomCobble' },
+          worn ? { materialVariant: { wearFactor: 0.36, weathering: 'moss', weatheringIntensity: 0.45 } } : {}
+        )
+      );
+    }
+  }
+
+  // Interactive floor trapdoor at (2, 2)
+  entities.push(
+    block('Cellar Trapdoor', 2, 2, { shape: 'trapdoor', material: 'timberPlank' }, {
+      materialVariant: { wearFactor: 0.28, weathering: 'muddy', weatheringIntensity: 0.4 },
+    })
+  );
+
+  // North chamber wall along z = -6 with central archway + barred/shuttered windows
+  entities.push(
+    block('North Wall NW', -6, -6, { shape: 'wallCube', material: 'hewnStone' }, {
+      materialVariant: { wearFactor: 0.48, weathering: 'moss', weatheringIntensity: 0.55 },
+    }),
+    block('Shuttered Window', -4, -6, { shape: 'windowWall', material: 'hewnStone', windowStyle: 'shuttered' }),
+    block('North Wall W', -2, -6, { shape: 'wallCube', material: 'hewnStone' }, {
+      materialVariant: { wearFactor: 0.24, weathering: 'cracked', weatheringIntensity: 0.5 },
+    }),
+    block('Main Vault Archway', 0, -6, { shape: 'archway', material: 'hewnStone', archStyle: 'arched' }),
+    block('North Wall E', 2, -6, { shape: 'wallCube', material: 'hewnStone' }),
+    block('Barred Window', 4, -6, { shape: 'windowWall', material: 'hewnStone', windowStyle: 'barred' }),
+    block('North Wall NE', 6, -6, { shape: 'wallCube', material: 'hewnStone' }, {
+      materialVariant: { wearFactor: 0.42, weathering: 'moss', weatheringIntensity: 0.5 },
+    })
+  );
+
+  // Inner vault chamber behind North wall (z = -8..-12)
+  for (let gx = -2; gx <= 2; gx += 2) {
+    for (let gz = -12; gz <= -8; gz += 2) {
+      entities.push(
+        block('Vault Floor', gx, gz, { shape: 'floorTile', material: 'crackedSlate' })
+      );
+    }
+  }
+  entities.push(
+    modDoor(
+      'Double Vault Door',
+      0,
+      -8,
+      {
+        frameShape: 'rectangular',
+        leafStyle: 'woodPlank',
+        openMode: 'doubleSplit',
+        slotStyle: 'peepSlot',
+        frameMaterial: 'masonryBrick',
+        requiresKey: true,
+      },
+      { materialVariant: { wearFactor: 0.2, weathering: 'muddy', weatheringIntensity: 0.35 } }
+    ),
+    block('Vault Wall W', -2, -8, { shape: 'wallCube', material: 'masonryBrick' }),
+    block('Vault Wall E', 2, -8, { shape: 'wallCube', material: 'masonryBrick' }),
+    block('Vault Back W', -2, -12, { shape: 'wallCube', material: 'hewnStone' }),
+    block('Vault Back C', 0, -12, { shape: 'wallCube', material: 'hewnStone' }),
+    block('Vault Back E', 2, -12, { shape: 'wallCube', material: 'hewnStone' })
+  );
+
+  // West cell alcove (x = -6..-8) guarded by a sliding iron-bar portcullis
+  entities.push(
+    block('Cell Wall N', -6, -4, { shape: 'wallCube', material: 'hewnStone' }),
+    modDoor(
+      'Iron Cell Portcullis',
+      -6,
+      -2,
+      {
+        frameShape: 'arched',
+        leafStyle: 'ironBars',
+        openMode: 'sliding',
+        slotStyle: 'none',
+        frameMaterial: 'hewnStone',
+        requiresKey: false,
+      },
+      { rotation: 90 }
+    ),
+    block('Cell Wall S', -6, 0, { shape: 'wallCube', material: 'hewnStone' }),
+    block('Cell Floor N', -8, -4, { shape: 'floorTile', material: 'packedDirt' }),
+    block('Cell Floor C', -8, -2, { shape: 'floorTile', material: 'packedDirt' }),
+    block('Cell Floor S', -8, 0, { shape: 'floorTile', material: 'packedDirt' }),
+    block('Cell Back N', -10, -4, { shape: 'wallCube', material: 'hewnStone' }),
+    block('Cell Back C', -10, -2, { shape: 'windowWall', material: 'hewnStone', windowStyle: 'barred' }, { rotation: 90 }),
+    block('Cell Back S', -10, 0, { shape: 'wallCube', material: 'hewnStone' })
+  );
+
+  // East wall & 2m upper mezzanine staircase (climb straight stairs at (4, 2) onto (+4, 0) & (+4, -2))
+  entities.push(
+    block('Stone Straight Stairs', 4, 2, { shape: 'stairsStraight', material: 'hewnStone' }),
+    block('Mezzanine Floor S', 4, 0, { shape: 'floorTile', material: 'timberPlank' }, { elevationY: 2 }),
+    block('Mezzanine Floor N', 4, -2, { shape: 'floorTile', material: 'timberPlank' }, { elevationY: 2 }),
+    block('Mezzanine Wall E', 6, 0, { shape: 'wallCube', material: 'hewnStone' }),
+    block('Mezzanine Wall NE', 6, -2, { shape: 'wallCube', material: 'hewnStone' }),
+    block('Mezzanine Parapet W', 2, -2, { shape: 'halfWall', material: 'hewnStone' }, { elevationY: 2, rotation: 90 }),
+
+    // West spiral stairs climbing up to a lookout pillar platform
+    block('Dungeon Spiral Stairs', -4, 2, { shape: 'stairsSpiral', material: 'hewnStone' }),
+    block('Watchtower Platform', -4, 0, { shape: 'floorTile', material: 'timberPlank' }, { elevationY: 2 }),
+
+    // Pillars framing the courtyard
+    block('Courtyard Pillar NW', -2, -2, { shape: 'pillar', material: 'hewnStone' }),
+    block('Courtyard Pillar NE', 2, -2, { shape: 'pillar', material: 'hewnStone' }),
+
+    // Mounted wall torches lighting the courtyard & vault
+    block('Arch Torch W', -2, -5, { shape: 'wallTorch', material: 'rustedIron' }),
+    block('Arch Torch E', 2, -5, { shape: 'wallTorch', material: 'rustedIron' }),
+    block('Vault Torch', 0, -11, { shape: 'wallTorch', material: 'rustedIron' }),
+    block('Mezzanine Torch', 5, -2, { shape: 'wallTorch', material: 'rustedIron' }, { elevationY: 2, rotation: -90 })
+  );
+
+  // Interactive game objects: Key in the West cell, chest on mezzanine, patrolling Skeleton
+  const cellKeyPt = at(-8, -2);
+  const mezzChestPt = at(4, -2);
+  const skelPt = at(0, -2);
+  entities.push(
+    createEntity('key', 'Vault Key', cellKeyPt.x, cellKeyPt.y),
+    createEntity('treasure', 'Upper Gallery Chest', mezzChestPt.x, mezzChestPt.y, {
+      elevationY: 2.24,
+      cards: [makeCard('playerTouches', ['giveTreasure', 'playSound', 'destroySelf'], '5 coins')],
+    }),
+    createEntity('baddie', 'Crypt Skeleton', skelPt.x, skelPt.y, {
+      health: 3,
+      speed: 2.6,
+      brain: 'Patroller',
+      cards: [makeCard('seesPlayer', ['chase', 'say'], 'None shall pass!')],
+    })
+  );
+
+  crypt.entities = entities;
+  crypt.startPoint = at(0, 4);
+  crypt.portalPoint = at(0, -10);
+  crypt.objectives = [
+    { id: uid(), text: 'Open the West Iron Cell Gate (Press E) & grab the Vault Key', isOptional: false },
+    { id: uid(), text: 'Climb the stone or spiral stairs to the 2m upper mezzanine', isOptional: true },
+    { id: uid(), text: 'Unlock the Double Vault Door & reach the exit portal', isOptional: false },
+  ];
+
+  return {
+    id: uid(),
+    name,
+    tagline: 'Build & explore multi-level snap-grid dungeons with animated gates, stairs & weathering.',
+    symbol: 'cube.fill',
+    colorHex: '#F59E0B',
+    updatedAt: new Date().toISOString(),
+    levels: [crypt],
+    heroName: 'Warden',
+    heroBody: 'Knight',
+    heroColors: { tunic: '#6366F1', cloak: '#F59E0B', hair: '#3B2820', skin: '#F4C7A1' },
+    enabledActions: [...StarterActions],
+    hud: defaultHUDProfile(),
+    currencies: ['Coins', 'Gems', 'Keys'],
+    coverTagline: '2m Snap Grid · Multi-style Doors · Stairs & Mezzanine · Wear & Moss.',
+    difficulty: 'Easy',
+    published: false,
+  };
+}
+
 export function projectFromTemplate(name: string, template: GameTemplate): GameProject {
   const cleanName = name.trim() || template.name;
   switch (template.id) {
@@ -2750,6 +2987,8 @@ export function projectFromTemplate(name: string, template: GameTemplate): GameP
       return buildDrivingProject(cleanName);
     case 'roguelike':
       return buildRoguelikeProject(cleanName);
+    case 'dungeonBuilder':
+      return buildDungeonBuilderProject(cleanName);
     case 'adventure':
       return buildCastleProject(cleanName);
     case 'platformer':

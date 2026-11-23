@@ -3,14 +3,21 @@ import {
   attribute,
   materialColor,
   materialOpacity,
+  materialRoughness,
   vec4,
   vertexColor,
 } from 'three/tsl';
-import { applyHsvShiftLinearTsl, upgradeToNodeMaterial } from './nodeMaterialUtils';
+import {
+  applyDegradeLayersTsl,
+  applyDegradeRoughnessTsl,
+  applyHsvShiftLinearTsl,
+  upgradeToNodeMaterial,
+} from './nodeMaterialUtils';
 import type {
   VertexPaintMode,
   VertexPaintStroke,
   VertexPaintTarget,
+  WeatheringPreset,
 } from '../types/maker';
 
 export interface VertexPaintBrushSettings {
@@ -24,6 +31,8 @@ export interface VertexPaintBrushSettings {
   saturationShift: number; // -0.8..+0.8
   valueShift: number; // -0.5..+0.5
   hueJitter: number; // 0..90 degrees
+  degradeForm?: WeatheringPreset;
+  degradeChipDepth?: number; // 0..1
 }
 
 // Reusable math scratch objects (zero GC during live pointer-move brushing)
@@ -76,13 +85,19 @@ export function computeShiftedHexColor(
 }
 
 /**
- * Ensures a BufferGeometry has mutable `color` (RGB linear) and `aPaintHsv` (hue, sat, val)
- * vertex attributes plus immutable baseline snapshots for non-destructive erasing/resetting.
+ * Ensures a BufferGeometry has mutable `color` (RGB linear), `aPaintHsv` (hue, sat, val),
+ * and multi-form weathering/degradation attributes (`aDegrade0`, `aDegrade1`, `aDegradeWet`),
+ * plus immutable baseline snapshots (including vertex positions & normals for physical chipping/erasing).
  */
 export function ensureGeometryVertexPaintAttributes(geo: THREE.BufferGeometry): void {
   const pos = geo.attributes.position as THREE.BufferAttribute | undefined;
   if (!pos) return;
   const count = pos.count;
+
+  if (!geo.attributes.normal) {
+    geo.computeVertexNormals();
+  }
+  const norm = geo.attributes.normal as THREE.BufferAttribute | undefined;
 
   let colAttr = geo.attributes.color as THREE.BufferAttribute | undefined;
   if (!colAttr || colAttr.count !== count || colAttr.itemSize !== 3) {
@@ -107,23 +122,59 @@ export function ensureGeometryVertexPaintAttributes(geo: THREE.BufferGeometry): 
     geo.setAttribute('aPaintHsv', hsvAttr);
   }
 
+  let deg0Attr = geo.attributes.aDegrade0 as THREE.BufferAttribute | undefined;
+  if (!deg0Attr || deg0Attr.count !== count || deg0Attr.itemSize !== 4) {
+    deg0Attr = new THREE.BufferAttribute(new Float32Array(count * 4), 4);
+    geo.setAttribute('aDegrade0', deg0Attr);
+  }
+
+  let deg1Attr = geo.attributes.aDegrade1 as THREE.BufferAttribute | undefined;
+  if (!deg1Attr || deg1Attr.count !== count || deg1Attr.itemSize !== 4) {
+    deg1Attr = new THREE.BufferAttribute(new Float32Array(count * 4), 4);
+    geo.setAttribute('aDegrade1', deg1Attr);
+  }
+
+  let degWetAttr = geo.attributes.aDegradeWet as THREE.BufferAttribute | undefined;
+  if (!degWetAttr || degWetAttr.count !== count || degWetAttr.itemSize !== 1) {
+    degWetAttr = new THREE.BufferAttribute(new Float32Array(count), 1);
+    geo.setAttribute('aDegradeWet', degWetAttr);
+  }
+
   if (!geo.userData.vpBaseColors) {
     geo.userData.vpBaseColors = new Float32Array(colAttr.array as Float32Array);
   }
   if (!geo.userData.vpBaseHsv) {
     geo.userData.vpBaseHsv = new Float32Array(hsvAttr.array as Float32Array);
   }
+  if (!geo.userData.vpBasePositions && pos.array instanceof Float32Array) {
+    geo.userData.vpBasePositions = new Float32Array(pos.array);
+  }
+  if (!geo.userData.vpBaseNormals && norm && norm.array instanceof Float32Array) {
+    geo.userData.vpBaseNormals = new Float32Array(norm.array);
+  }
+  if (typeof geo.userData.vpGeoScale !== 'number') {
+    geo.computeBoundingBox();
+    const bb = geo.boundingBox;
+    if (bb) {
+      const sz = new THREE.Vector3();
+      bb.getSize(sz);
+      geo.userData.vpGeoScale = Math.max(0.25, Math.min(sz.x || 1, sz.y || 1, sz.z || 1, 2.5));
+    } else {
+      geo.userData.vpGeoScale = 1.0;
+    }
+  }
 }
 
 /**
  * Upgrades/patches any standard/toon/physical/basic material with per-vertex `aPaintHsv`
- * TSL colorNode RGB<->HSV hue/saturation/value shifting so Hue Shift vertex painting
- * preserves 100% of underlying bark, leaf, or uploaded seamless textures under WebGPURenderer!
+ * and multi-form `aDegrade0`/`aDegrade1`/`aDegradeWet` TSL shaders so Hue Shift, Color,
+ * and Weathering/Degrader painting preserve underlying bark, wood, stone, or uploaded textures
+ * natively under WebGPURenderer!
  */
 export function enableVertexPaintHsvOnMaterial(mat: THREE.Material): THREE.Material {
   if (!mat) return mat;
 
-  // Materials already patched by patchCanopyMaterial with enableVertexPaintHsv already support aPaintHsv
+  // Materials already patched by patchCanopyMaterial with enableVertexPaintHsv already support aPaintHsv + degrade
   if (mat.userData.hasVertexPaintHsv) {
     if ('vertexColors' in mat) {
       const std = mat as THREE.MeshStandardMaterial;
@@ -142,17 +193,47 @@ export function enableVertexPaintHsvOnMaterial(mat: THREE.Material): THREE.Mater
   nodeMat.vertexColors = false;
 
   const vPaintHsv = attribute('aPaintHsv', 'vec3');
+  const vDeg0 = attribute('aDegrade0', 'vec4');
+  const vDeg1 = attribute('aDegrade1', 'vec4');
+  const vDegWet = attribute('aDegradeWet', 'float');
+
   const combinedRgb = materialColor.rgb.mul(vertexColor().rgb);
   const shiftedRgb = applyHsvShiftLinearTsl(combinedRgb, vPaintHsv);
-  nodeMat.colorNode = vec4(shiftedRgb.rgb, materialOpacity);
+  const degradedRgb = applyDegradeLayersTsl(
+    shiftedRgb,
+    vDeg0.x, // moss
+    vDeg0.y, // cracks
+    vDeg0.z, // chipped
+    vDeg0.w, // scorch
+    vDeg1.x, // mud
+    vDeg1.y, // frost
+    vDeg1.z, // bleached
+    vDeg1.w, // rusted
+    vDegWet  // wet
+  );
+  nodeMat.colorNode = vec4(degradedRgb.rgb, materialOpacity);
+  if ('roughnessNode' in nodeMat) {
+    (nodeMat as unknown as { roughnessNode: unknown }).roughnessNode = applyDegradeRoughnessTsl(
+      materialRoughness,
+      vDeg0.x,
+      vDeg0.y,
+      vDeg0.z,
+      vDeg0.w,
+      vDeg1.x,
+      vDeg1.y,
+      vDeg1.z,
+      vDeg1.w,
+      vDegWet
+    );
+  }
   nodeMat.needsUpdate = true;
   return nodeMat;
 }
 
 /**
- * Prepares all paintable meshes inside a 3D object/tree for interactive vertex painting:
- * ensures unique non-shared BufferGeometries, initializes `color` + `aPaintHsv` attributes,
- * snapshots original vertex colors for non-destructive erasing, and upgrades material shaders.
+ * Prepares all paintable meshes inside a 3D object/tree for interactive vertex painting & degrading:
+ * ensures unique non-shared BufferGeometries, initializes color/HSV/degrade attributes,
+ * snapshots original positions/normals/colors for non-destructive erasing, and upgrades material shaders.
  */
 export function prepareObjectForVertexPainting(root: THREE.Object3D): THREE.Mesh[] {
   const seenGeos = new Set<THREE.BufferGeometry>();
@@ -183,7 +264,7 @@ export function prepareObjectForVertexPainting(root: THREE.Object3D): THREE.Mesh
 }
 
 /**
- * Restores every vertex on every paintable mesh in `root` back to its pristine unpainted baseline.
+ * Restores every vertex on every paintable mesh in `root` back to its pristine unpainted & undegraded baseline.
  */
 export function resetObjectVertexPaint(root: THREE.Object3D): void {
   root.traverse((child) => {
@@ -191,8 +272,16 @@ export function resetObjectVertexPaint(root: THREE.Object3D): void {
     const geo = child.geometry;
     const baseCols = geo.userData.vpBaseColors as Float32Array | undefined;
     const baseHsv = geo.userData.vpBaseHsv as Float32Array | undefined;
+    const basePos = geo.userData.vpBasePositions as Float32Array | undefined;
+    const baseNorm = geo.userData.vpBaseNormals as Float32Array | undefined;
     const colAttr = geo.attributes.color as THREE.BufferAttribute | undefined;
     const hsvAttr = geo.attributes.aPaintHsv as THREE.BufferAttribute | undefined;
+    const posAttr = geo.attributes.position as THREE.BufferAttribute | undefined;
+    const normAttr = geo.attributes.normal as THREE.BufferAttribute | undefined;
+    const deg0Attr = geo.attributes.aDegrade0 as THREE.BufferAttribute | undefined;
+    const deg1Attr = geo.attributes.aDegrade1 as THREE.BufferAttribute | undefined;
+    const degWetAttr = geo.attributes.aDegradeWet as THREE.BufferAttribute | undefined;
+
     if (baseCols && colAttr && colAttr.array instanceof Float32Array) {
       colAttr.array.set(baseCols);
       colAttr.needsUpdate = true;
@@ -200,6 +289,26 @@ export function resetObjectVertexPaint(root: THREE.Object3D): void {
     if (baseHsv && hsvAttr && hsvAttr.array instanceof Float32Array) {
       hsvAttr.array.set(baseHsv);
       hsvAttr.needsUpdate = true;
+    }
+    if (basePos && posAttr && posAttr.array instanceof Float32Array) {
+      posAttr.array.set(basePos);
+      posAttr.needsUpdate = true;
+    }
+    if (baseNorm && normAttr && normAttr.array instanceof Float32Array) {
+      normAttr.array.set(baseNorm);
+      normAttr.needsUpdate = true;
+    }
+    if (deg0Attr && deg0Attr.array instanceof Float32Array) {
+      deg0Attr.array.fill(0);
+      deg0Attr.needsUpdate = true;
+    }
+    if (deg1Attr && deg1Attr.array instanceof Float32Array) {
+      deg1Attr.array.fill(0);
+      deg1Attr.needsUpdate = true;
+    }
+    if (degWetAttr && degWetAttr.array instanceof Float32Array) {
+      degWetAttr.array.fill(0);
+      degWetAttr.needsUpdate = true;
     }
   });
 }
@@ -213,7 +322,8 @@ function matchesTarget(mesh: THREE.Mesh, target: VertexPaintTarget): boolean {
 
 /**
  * Applies a single 3D spherical brush dab (in `root` local coordinates) directly to vertex
- * `color` and `aPaintHsv` buffers with smooth radial falloff. Runs in <1ms for 60fps brushing.
+ * `color`, `aPaintHsv`, `aDegrade0`/`aDegrade1`/`aDegradeWet`, and physical chip displacement
+ * with smooth radial falloff. Runs in <1ms for 60fps brushing.
  */
 export function applyVertexPaintDab(
   root: THREE.Object3D,
@@ -233,6 +343,8 @@ export function applyVertexPaintDab(
   const satShift = THREE.MathUtils.clamp(settings.saturationShift ?? 0, -0.8, 0.8);
   const valShift = THREE.MathUtils.clamp(settings.valueShift ?? 0, -0.5, 0.5);
   const jitterDeg = THREE.MathUtils.clamp(settings.hueJitter ?? 0, 0, 90);
+  const degradeForm: WeatheringPreset = settings.degradeForm ?? 'cracked';
+  const chipDepth = THREE.MathUtils.clamp(settings.degradeChipDepth ?? 0.45, 0, 1);
 
   // Precompute base brush color shifted by hueShift/sat/val for 'paint' mode
   _cBase.set(settings.color);
@@ -261,16 +373,28 @@ export function applyVertexPaintDab(
     const posAttr = geo.attributes.position as THREE.BufferAttribute | undefined;
     const colAttr = geo.attributes.color as THREE.BufferAttribute | undefined;
     const hsvAttr = geo.attributes.aPaintHsv as THREE.BufferAttribute | undefined;
-    if (!posAttr || !colAttr || !hsvAttr) continue;
+    const deg0Attr = geo.attributes.aDegrade0 as THREE.BufferAttribute | undefined;
+    const deg1Attr = geo.attributes.aDegrade1 as THREE.BufferAttribute | undefined;
+    const degWetAttr = geo.attributes.aDegradeWet as THREE.BufferAttribute | undefined;
+    if (!posAttr || !colAttr || !hsvAttr || !deg0Attr || !deg1Attr || !degWetAttr) continue;
 
     // Matrix transforming vertex position from mesh local space into `root` local space
     _meshToRootMat.multiplyMatrices(_invRootMat, mesh.matrixWorld);
 
     const baseCols = geo.userData.vpBaseColors as Float32Array | undefined;
+    const basePos = geo.userData.vpBasePositions as Float32Array | undefined;
+    const baseNorm = geo.userData.vpBaseNormals as Float32Array | undefined;
+    const geoScale = typeof geo.userData.vpGeoScale === 'number' ? geo.userData.vpGeoScale : 1.0;
+
     let meshTouched = false;
+    let meshDeformed = false;
 
     for (let i = 0; i < posAttr.count; i++) {
-      _vPos.set(posAttr.getX(i), posAttr.getY(i), posAttr.getZ(i)).applyMatrix4(_meshToRootMat);
+      const i3 = i * 3;
+      const vx = basePos ? basePos[i3] : posAttr.getX(i);
+      const vy = basePos ? basePos[i3 + 1] : posAttr.getY(i);
+      const vz = basePos ? basePos[i3 + 2] : posAttr.getZ(i);
+      _vPos.set(vx, vy, vz).applyMatrix4(_meshToRootMat);
 
       const dx = _vPos.x - localCenter.x;
       const dy = _vPos.y - localCenter.y;
@@ -293,7 +417,6 @@ export function applyVertexPaintDab(
       meshTouched = true;
 
       if (settings.mode === 'erase') {
-        const i3 = i * 3;
         const br = baseCols ? baseCols[i3] : 1;
         const bg = baseCols ? baseCols[i3 + 1] : 1;
         const bb = baseCols ? baseCols[i3 + 2] : 1;
@@ -309,6 +432,119 @@ export function applyVertexPaintDab(
           THREE.MathUtils.lerp(hsvAttr.getY(i), 0, w),
           THREE.MathUtils.lerp(hsvAttr.getZ(i), 0, w)
         );
+        deg0Attr.setXYZW(
+          i,
+          THREE.MathUtils.lerp(deg0Attr.getX(i), 0, w),
+          THREE.MathUtils.lerp(deg0Attr.getY(i), 0, w),
+          THREE.MathUtils.lerp(deg0Attr.getZ(i), 0, w),
+          THREE.MathUtils.lerp(deg0Attr.getW(i), 0, w)
+        );
+        deg1Attr.setXYZW(
+          i,
+          THREE.MathUtils.lerp(deg1Attr.getX(i), 0, w),
+          THREE.MathUtils.lerp(deg1Attr.getY(i), 0, w),
+          THREE.MathUtils.lerp(deg1Attr.getZ(i), 0, w),
+          THREE.MathUtils.lerp(deg1Attr.getW(i), 0, w)
+        );
+        degWetAttr.setX(i, THREE.MathUtils.lerp(degWetAttr.getX(i), 0, w));
+
+        if (basePos) {
+          const curX = posAttr.getX(i);
+          const curY = posAttr.getY(i);
+          const curZ = posAttr.getZ(i);
+          const bx = basePos[i3];
+          const by = basePos[i3 + 1];
+          const bz = basePos[i3 + 2];
+          if (Math.abs(curX - bx) + Math.abs(curY - by) + Math.abs(curZ - bz) > 0.0001) {
+            posAttr.setXYZ(
+              i,
+              THREE.MathUtils.lerp(curX, bx, w),
+              THREE.MathUtils.lerp(curY, by, w),
+              THREE.MathUtils.lerp(curZ, bz, w)
+            );
+            meshDeformed = true;
+          }
+        }
+      } else if (settings.mode === 'degrade') {
+        const organic = THREE.MathUtils.clamp(
+          0.72 + organicSpatialNoise(_vPos.x * 1.4, _vPos.y * 1.4, _vPos.z * 1.4, seed) * 0.28,
+          0.35,
+          1.0
+        );
+        const effW = THREE.MathUtils.clamp(w * organic, 0, 1);
+
+        if (degradeForm === 'none') {
+          // Restore degradation channels while leaving painted hue/color intact
+          deg0Attr.setXYZW(
+            i,
+            THREE.MathUtils.lerp(deg0Attr.getX(i), 0, w),
+            THREE.MathUtils.lerp(deg0Attr.getY(i), 0, w),
+            THREE.MathUtils.lerp(deg0Attr.getZ(i), 0, w),
+            THREE.MathUtils.lerp(deg0Attr.getW(i), 0, w)
+          );
+          deg1Attr.setXYZW(
+            i,
+            THREE.MathUtils.lerp(deg1Attr.getX(i), 0, w),
+            THREE.MathUtils.lerp(deg1Attr.getY(i), 0, w),
+            THREE.MathUtils.lerp(deg1Attr.getZ(i), 0, w),
+            THREE.MathUtils.lerp(deg1Attr.getW(i), 0, w)
+          );
+          degWetAttr.setX(i, THREE.MathUtils.lerp(degWetAttr.getX(i), 0, w));
+        } else {
+          if (degradeForm === 'moss') {
+            deg0Attr.setX(i, Math.min(1, Math.max(deg0Attr.getX(i), effW * 0.45) + effW * 0.55));
+          } else if (degradeForm === 'cracked') {
+            deg0Attr.setY(i, Math.min(1, Math.max(deg0Attr.getY(i), effW * 0.45) + effW * 0.55));
+          } else if (degradeForm === 'chipped') {
+            deg0Attr.setZ(i, Math.min(1, Math.max(deg0Attr.getZ(i), effW * 0.45) + effW * 0.55));
+          } else if (degradeForm === 'scorched') {
+            deg0Attr.setW(i, Math.min(1, Math.max(deg0Attr.getW(i), effW * 0.45) + effW * 0.55));
+          } else if (degradeForm === 'muddy') {
+            deg1Attr.setX(i, Math.min(1, Math.max(deg1Attr.getX(i), effW * 0.45) + effW * 0.55));
+          } else if (degradeForm === 'snow') {
+            deg1Attr.setY(i, Math.min(1, Math.max(deg1Attr.getY(i), effW * 0.45) + effW * 0.55));
+          } else if (degradeForm === 'bleached') {
+            deg1Attr.setZ(i, Math.min(1, Math.max(deg1Attr.getZ(i), effW * 0.45) + effW * 0.55));
+          } else if (degradeForm === 'rusted') {
+            deg1Attr.setW(i, Math.min(1, Math.max(deg1Attr.getW(i), effW * 0.45) + effW * 0.55));
+          } else if (degradeForm === 'wet') {
+            degWetAttr.setX(i, Math.min(1, Math.max(degWetAttr.getX(i), effW * 0.45) + effW * 0.55));
+          }
+
+          // Physical geometry dent / chip displacement for Chipped & Cracked forms
+          if (
+            (degradeForm === 'chipped' || degradeForm === 'cracked') &&
+            chipDepth > 0.01 &&
+            basePos &&
+            baseNorm
+          ) {
+            const chipHash = hashVertex3(bxSafe(basePos, i3), basePos[i3 + 1], basePos[i3 + 2], seed + 17);
+            const facetNoise = organicSpatialNoise(_vPos.x * 2.8, _vPos.y * 2.8, _vPos.z * 2.8, seed + 53);
+            const carveProfile =
+              degradeForm === 'chipped'
+                ? chipHash > 0.28
+                  ? 0.45 + 0.55 * chipHash
+                  : 0.15
+                : Math.max(0, 0.5 - Math.abs(facetNoise)) * 1.4;
+            const maxBite = Math.min(0.14, geoScale * 0.12) * chipDepth;
+            const targetDent = maxBite * falloff * Math.min(1, opacity * 1.15) * carveProfile;
+            if (targetDent > 0.0005) {
+              const bx = basePos[i3];
+              const by = basePos[i3 + 1];
+              const bz = basePos[i3 + 2];
+              const nx = baseNorm[i3];
+              const ny = baseNorm[i3 + 1];
+              const nz = baseNorm[i3 + 2];
+              const curX = posAttr.getX(i);
+              const curY = posAttr.getY(i);
+              const curZ = posAttr.getZ(i);
+              const existingDent = Math.hypot(curX - bx, curY - by, curZ - bz);
+              const nextDent = Math.min(maxBite * 1.15, Math.max(existingDent, targetDent));
+              posAttr.setXYZ(i, bx - nx * nextDent, by - ny * nextDent, bz - nz * nextDent);
+              meshDeformed = true;
+            }
+          }
+        }
       } else if (settings.mode === 'hueShift') {
         const jNoise = jitterDeg > 0.5 ? (hashVertex3(_vPos.x, _vPos.y, _vPos.z, seed) - 0.5) * 2 * (jitterDeg / 360) : 0;
         const targetHue = hueNorm + jNoise;
@@ -327,7 +563,6 @@ export function applyVertexPaintDab(
         const sShiftLocal = satShift + patchNoise * 0.14;
         const vShiftLocal = valShift + patchNoise * 0.16;
 
-        // Combine rich per-vertex HSV texture shift + subtle organic color tinting
         hsvAttr.setXYZ(
           i,
           THREE.MathUtils.lerp(hsvAttr.getX(i), hShiftLocal, w * 0.9),
@@ -372,7 +607,6 @@ export function applyVertexPaintDab(
         );
         colAttr.setXYZ(i, _cTmp.r, _cTmp.g, _cTmp.b);
 
-        // Gently neutralize prior HSV shift on painted area so chosen color reads true
         hsvAttr.setXYZ(
           i,
           THREE.MathUtils.lerp(hsvAttr.getX(i), 0, w * 0.65),
@@ -385,6 +619,13 @@ export function applyVertexPaintDab(
     if (meshTouched) {
       colAttr.needsUpdate = true;
       hsvAttr.needsUpdate = true;
+      deg0Attr.needsUpdate = true;
+      deg1Attr.needsUpdate = true;
+      degWetAttr.needsUpdate = true;
+      if (meshDeformed) {
+        posAttr.needsUpdate = true;
+        geo.computeVertexNormals();
+      }
       anyModified = true;
     }
   }
@@ -392,8 +633,12 @@ export function applyVertexPaintDab(
   return anyModified;
 }
 
+function bxSafe(arr: Float32Array, i3: number): number {
+  return arr[i3] ?? 0;
+}
+
 /**
- * Deterministically replays all saved 3D vertex paint strokes onto a built tree or object mesh.
+ * Deterministically replays all saved 3D vertex paint & degradation strokes onto a built tree or object mesh.
  */
 export function applyVertexPaintStrokesToObject(
   root: THREE.Object3D,
@@ -417,6 +662,8 @@ export function applyVertexPaintStrokesToObject(
       saturationShift: stroke.saturationShift ?? 0,
       valueShift: stroke.valueShift ?? 0,
       hueJitter: stroke.hueJitter ?? 0,
+      degradeForm: stroke.degradeForm,
+      degradeChipDepth: stroke.degradeChipDepth,
     };
     for (let p = 0; p < stroke.points.length; p++) {
       const [x, y, z] = stroke.points[p];
@@ -427,8 +674,8 @@ export function applyVertexPaintStrokesToObject(
 }
 
 /**
- * Generates an organic multi-dab auto-dapple stroke over the visible leaves or branches
- * so creators can immediately introduce painterly non-repetitive color variation in 1 click.
+ * Generates an organic multi-dab auto-dapple or auto-degrade stroke over the visible parts
+ * so creators can immediately weather or dapple an object in 1 click.
  */
 export function generateOrganicDappleStroke(
   root: THREE.Object3D,
@@ -453,7 +700,6 @@ export function generateOrganicDappleStroke(
 
   if (candidates.length === 0) return null;
 
-  // Deterministic pseudo-random pick of ~14 organic dapple anchors
   let st = (seed >>> 0) || 1;
   const rand = () => {
     st = (st + 0x6d2b79f5) >>> 0;
@@ -462,7 +708,7 @@ export function generateOrganicDappleStroke(
     return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
   };
 
-  const count = Math.min(16, Math.max(6, Math.round(candidates.length * 0.25)));
+  const count = Math.min(18, Math.max(8, Math.round(candidates.length * 0.28)));
   const points: [number, number, number][] = [];
   for (let i = 0; i < count; i++) {
     const pick = candidates[Math.floor(rand() * candidates.length)];
@@ -473,11 +719,14 @@ export function generateOrganicDappleStroke(
     ]);
   }
 
+  const isDegrade = settings.mode === 'degrade';
   return {
     id: `vp_${Date.now().toString(36)}_${Math.floor(rand() * 9999)}`,
     points,
-    radius: Math.max(0.45, settings.radius * 1.15),
-    opacity: Math.min(0.65, Math.max(0.28, settings.opacity)),
+    radius: Math.max(0.42, settings.radius * 1.15),
+    opacity: isDegrade
+      ? Math.min(0.95, Math.max(0.32, settings.opacity))
+      : Math.min(0.65, Math.max(0.28, settings.opacity)),
     softness: 0.82,
     mode: settings.mode === 'erase' ? 'organicJitter' : settings.mode,
     target: settings.target,
@@ -486,6 +735,9 @@ export function generateOrganicDappleStroke(
     saturationShift: settings.saturationShift,
     valueShift: settings.valueShift,
     hueJitter: Math.max(24, settings.hueJitter),
+    degradeForm: isDegrade ? settings.degradeForm ?? 'cracked' : undefined,
+    degradeChipDepth: isDegrade ? settings.degradeChipDepth ?? 0.45 : undefined,
     seed,
   };
 }
+

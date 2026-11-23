@@ -11,6 +11,7 @@ import {
   length,
   materialColor,
   materialOpacity,
+  materialRoughness,
   max,
   modelWorldMatrix,
   normalLocal,
@@ -62,7 +63,14 @@ import {
   applyVertexPaintStrokesToObject,
   prepareObjectForVertexPainting,
 } from './vertexPainter';
-import { applyHsvShiftLinearTsl, safeMaterialReference, upgradeToNodeMaterial } from './nodeMaterialUtils';
+import {
+  applyDegradeLayersTsl,
+  applyDegradeRoughnessTsl,
+  applyHsvShiftLinearTsl,
+  applyWearDingsScratchesTsl,
+  safeMaterialReference,
+  upgradeToNodeMaterial,
+} from './nodeMaterialUtils';
 import { buildEzTreeGroup } from './ezTreeBuilder';
 
 export interface CanopyPuffTransform {
@@ -486,7 +494,7 @@ export function patchCanopyMaterial(
     nodeMat.userData._vpBakedVertexColors = true;
   }
 
-  const colKey = `${hadVertexColors ? 'vc' : 'nvc'}|${instanced ? 'i' : 'u'}|${enableVertexPaintHsv ? 'vp' : 'nvp'}`;
+  const colKey = `${hadVertexColors ? 'vc' : 'nvc'}|${instanced ? 'i' : 'u'}|${enableVertexPaintHsv ? 'vp2' : 'nvp'}`;
   let cachedColorNode = _canopyColorNodeCache.get(colKey);
   if (!cachedColorNode) {
     const rgbNode = hadVertexColors
@@ -502,10 +510,49 @@ export function patchCanopyMaterial(
       : baseShift;
 
     const shiftedRgb = applyHsvShiftLinearTsl(rgbNode, totalShift);
-    cachedColorNode = vec4(shiftedRgb.rgb, materialOpacity);
+    const degradedRgb = enableVertexPaintHsv
+      ? applyDegradeLayersTsl(
+          shiftedRgb.rgb,
+          attribute('aDegrade0', 'vec4').x,
+          attribute('aDegrade0', 'vec4').y,
+          attribute('aDegrade0', 'vec4').z,
+          attribute('aDegrade0', 'vec4').w,
+          attribute('aDegrade1', 'vec4').x,
+          attribute('aDegrade1', 'vec4').y,
+          attribute('aDegrade1', 'vec4').z,
+          attribute('aDegrade1', 'vec4').w,
+          attribute('aDegradeWet', 'float')
+        )
+      : shiftedRgb.rgb;
+    const uWearFactor = safeMaterialReference('userData.uWearFactor', 'float', 0) as unknown as ReturnType<typeof float>;
+    const finalRgb = applyWearDingsScratchesTsl(degradedRgb, clamp(uWearFactor, 0.0, 1.0));
+    cachedColorNode = vec4(finalRgb, materialOpacity);
     _canopyColorNodeCache.set(colKey, cachedColorNode);
   }
   nodeMat.colorNode = cachedColorNode;
+
+  if (enableVertexPaintHsv && 'roughnessNode' in nodeMat) {
+    const deg0 = attribute('aDegrade0', 'vec4');
+    const deg1 = attribute('aDegrade1', 'vec4');
+    const degWet = attribute('aDegradeWet', 'float');
+    (nodeMat as unknown as { roughnessNode: unknown }).roughnessNode = applyDegradeRoughnessTsl(
+      materialRoughness,
+      deg0.x,
+      deg0.y,
+      deg0.z,
+      deg0.w,
+      deg1.x,
+      deg1.y,
+      deg1.z,
+      deg1.w,
+      degWet
+    );
+  }
+
+  nodeMat.userData.__canopyWeatherReady = true;
+  if (typeof nodeMat.userData.uWearFactor !== 'number') {
+    nodeMat.userData.uWearFactor = 0;
+  }
 
   attachBotwPainterlyShader(nodeMat, {
     isFoliage: true,

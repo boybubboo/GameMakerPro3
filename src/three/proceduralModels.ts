@@ -11,6 +11,7 @@ import {
 } from './treeGeometry';
 import { buildFxEmitterFallbackGroup } from './fxEmitterRuntime';
 import { DUNGEON_TRAP_STYLE_META } from '../services/DungeonGenerator';
+import { buildBuildingBlockMesh, buildModularDoorMesh } from './buildingBlocks';
 
 export interface CreatureAnimRefs {
   creatureType: CreatureBodyId;
@@ -631,12 +632,12 @@ function buildPropPresetMesh(preset: PropPresetId): THREE.Group {
 
   if (preset === 'tavern') {
     // Woodland Acorn & Lantern Tavern
-    const plinth = new THREE.Mesh(new THREE.BoxGeometry(6.8, 0.45, 5.4), darkStoneMat);
+    const plinth = new THREE.Mesh(new THREE.BoxGeometry(6.8, 0.45, 5.4, 6, 2, 5), darkStoneMat);
     plinth.position.y = 0.22;
     plinth.receiveShadow = true;
     plinth.castShadow = true;
 
-    const mainHall = new THREE.Mesh(new THREE.BoxGeometry(5.6, 2.75, 4.0), plasterMat);
+    const mainHall = new THREE.Mesh(new THREE.BoxGeometry(5.6, 2.75, 4.0, 5, 3, 4), plasterMat);
     mainHall.position.set(0, 1.82, -0.35);
     mainHall.castShadow = true;
     mainHall.receiveShadow = true;
@@ -876,7 +877,7 @@ function buildPropPresetMesh(preset: PropPresetId): THREE.Group {
     lowerShelf.receiveShadow = true;
 
     // Thick plank benchtop
-    const benchTop = new THREE.Mesh(new THREE.BoxGeometry(2.16, 0.14, 1.12), pineWoodMat);
+    const benchTop = new THREE.Mesh(new THREE.BoxGeometry(2.16, 0.14, 1.12, 4, 2, 3), pineWoodMat);
     benchTop.position.set(0, 0.96, 0);
     benchTop.castShadow = true;
     benchTop.receiveShadow = true;
@@ -960,14 +961,14 @@ function buildPropPresetMesh(preset: PropPresetId): THREE.Group {
     );
   } else {
     // signpost
-    const post = new THREE.Mesh(new THREE.CylinderGeometry(0.09, 0.11, 2.05, 8), oakMat);
+    const post = new THREE.Mesh(new THREE.CylinderGeometry(0.09, 0.11, 2.05, 10, 4), oakMat);
     post.position.y = 1.02;
     post.castShadow = true;
-    const b1 = new THREE.Mesh(new THREE.BoxGeometry(1.15, 0.34, 0.08), pineWoodMat);
+    const b1 = new THREE.Mesh(new THREE.BoxGeometry(1.15, 0.34, 0.08, 6, 3, 2), pineWoodMat);
     b1.position.set(0.28, 1.72, 0.04);
     b1.rotation.y = 0.18;
     b1.castShadow = true;
-    const b2 = new THREE.Mesh(new THREE.BoxGeometry(1.05, 0.32, 0.08), pineWoodMat);
+    const b2 = new THREE.Mesh(new THREE.BoxGeometry(1.05, 0.32, 0.08, 6, 3, 2), pineWoodMat);
     b2.position.set(-0.24, 1.32, -0.04);
     b2.rotation.y = -0.22;
     b2.castShadow = true;
@@ -1854,6 +1855,13 @@ export function buildEntityMesh(entity: LevelEntity): THREE.Group {
     return group;
   }
 
+  if (entity.buildingBlock) {
+    group.add(buildBuildingBlockMesh(entity.buildingBlock));
+    group.rotation.y = (entity.rotation * Math.PI) / 180;
+    group.scale.setScalar(Math.max(0.35, Math.min(3, entity.scale)));
+    return group;
+  }
+
   switch (entity.kind) {
     case 'baddie': {
       addShadow(entity.isBoss ? 0.9 : 0.55);
@@ -2083,21 +2091,25 @@ export function buildEntityMesh(entity: LevelEntity): THREE.Group {
 
     case 'door': {
       addShadow(0.95);
+      if (entity.doorConfig) {
+        group.add(buildModularDoorMesh(entity.doorConfig));
+        break;
+      }
       const stoneMat = new THREE.MeshStandardMaterial({ color: '#7D828F', roughness: 0.85 });
       const woodMat = new THREE.MeshStandardMaterial({ color: '#7B4B2A', roughness: 0.75 });
       const ironMat = new THREE.MeshStandardMaterial({ color: '#3B3F46', roughness: 0.35, metalness: 0.8 });
-      const pillarL = new THREE.Mesh(new THREE.BoxGeometry(0.34, 2.2, 0.45), stoneMat);
+      const pillarL = new THREE.Mesh(new THREE.BoxGeometry(0.34, 2.2, 0.45, 3, 6, 3), stoneMat);
       pillarL.position.set(-0.78, 1.1, 0);
       pillarL.castShadow = true;
       const pillarR = pillarL.clone();
       pillarR.position.x = 0.78;
-      const lintel = new THREE.Mesh(new THREE.BoxGeometry(2.05, 0.36, 0.52), stoneMat);
+      const lintel = new THREE.Mesh(new THREE.BoxGeometry(2.05, 0.36, 0.52, 6, 2, 2), stoneMat);
       lintel.position.y = 2.24;
       lintel.castShadow = true;
-      const leaf = new THREE.Mesh(new THREE.BoxGeometry(1.22, 1.98, 0.16), woodMat);
+      const leaf = new THREE.Mesh(new THREE.BoxGeometry(1.22, 1.98, 0.16, 4, 6, 2), woodMat);
       leaf.position.y = 0.99;
       leaf.userData.doorLeaf = true;
-      const band = new THREE.Mesh(new THREE.BoxGeometry(1.24, 0.12, 0.2), ironMat);
+      const band = new THREE.Mesh(new THREE.BoxGeometry(1.24, 0.12, 0.2, 4, 1, 1), ironMat);
       band.position.y = 1.45;
       const lock = new THREE.Mesh(new THREE.BoxGeometry(0.2, 0.26, 0.24), new THREE.MeshStandardMaterial({ color: '#F2C230', metalness: 0.85, roughness: 0.25 }));
       lock.position.set(0.38, 0.96, 0);
@@ -2126,7 +2138,7 @@ export function buildEntityMesh(entity: LevelEntity): THREE.Group {
           : {}),
       });
 
-      const plate = new THREE.Mesh(new THREE.BoxGeometry(1.24, 0.12, 1.24), baseMat);
+      const plate = new THREE.Mesh(new THREE.BoxGeometry(1.24, 0.12, 1.24, 4, 2, 4), baseMat);
       plate.position.y = 0.06;
       plate.receiveShadow = true;
       group.add(plate);
@@ -2319,15 +2331,17 @@ export function buildEntityMesh(entity: LevelEntity): THREE.Group {
       const isBridge = entity.platformPreset === 'swingingBridge';
       const deck = new THREE.Mesh(
         isDisc
-          ? new THREE.CylinderGeometry(1.1, 1.0, 0.3, 18)
-          : new THREE.BoxGeometry(isBridge ? 2.5 : 2.0, 0.3, isBridge ? 1.5 : 2.0),
+          ? new THREE.CylinderGeometry(1.1, 1.0, 0.3, 24, 2)
+          : new THREE.BoxGeometry(isBridge ? 2.5 : 2.0, 0.3, isBridge ? 1.5 : 2.0, 6, 2, 6),
         stoneMat
       );
       deck.position.y = 0.15;
       deck.castShadow = true;
       deck.receiveShadow = true;
       const rim = new THREE.Mesh(
-        isDisc ? new THREE.TorusGeometry(1.06, 0.06, 8, 20) : new THREE.BoxGeometry(isBridge ? 2.54 : 2.04, 0.08, isBridge ? 1.54 : 2.04),
+        isDisc
+          ? new THREE.TorusGeometry(1.06, 0.06, 8, 24)
+          : new THREE.BoxGeometry(isBridge ? 2.54 : 2.04, 0.08, isBridge ? 1.54 : 2.04, 6, 1, 6),
         trimMat
       );
       if (isDisc) rim.rotation.x = Math.PI / 2;
@@ -2355,11 +2369,11 @@ export function buildEntityMesh(entity: LevelEntity): THREE.Group {
 
       if (isThrone) {
         const goldMat = new THREE.MeshStandardMaterial({ color: '#F2C230', roughness: 0.3, metalness: 0.8 });
-        const seat = new THREE.Mesh(new THREE.BoxGeometry(0.95, 0.48, 0.8), goldMat);
+        const seat = new THREE.Mesh(new THREE.BoxGeometry(0.95, 0.48, 0.8, 4, 2, 4), goldMat);
         seat.position.y = 0.24;
-        const back = new THREE.Mesh(new THREE.BoxGeometry(0.95, 1.3, 0.22), goldMat);
+        const back = new THREE.Mesh(new THREE.BoxGeometry(0.95, 1.3, 0.22, 4, 5, 2), goldMat);
         back.position.set(0, 0.88, -0.29);
-        const cushion = new THREE.Mesh(new THREE.BoxGeometry(0.74, 0.12, 0.62), new THREE.MeshStandardMaterial({ color: '#B8293D', roughness: 0.8 }));
+        const cushion = new THREE.Mesh(new THREE.BoxGeometry(0.74, 0.12, 0.62, 3, 1, 3), new THREE.MeshStandardMaterial({ color: '#B8293D', roughness: 0.8 }));
         cushion.position.y = 0.52;
         group.add(seat, back, cushion);
       } else if (propStyle === 'arcaneBraziers') {
@@ -2389,7 +2403,7 @@ export function buildEntityMesh(entity: LevelEntity): THREE.Group {
           roughness: 0.65,
         });
         const accentMat = new THREE.MeshStandardMaterial({ color: '#8C6239', roughness: 0.5, metalness: 0.45 });
-        const plinth = new THREE.Mesh(new THREE.BoxGeometry(0.76, 0.48, 0.76), slabMat);
+        const plinth = new THREE.Mesh(new THREE.BoxGeometry(0.76, 0.48, 0.76, 4, 3, 4), slabMat);
         plinth.position.y = 0.24;
         plinth.castShadow = true;
         const skull = new THREE.Mesh(new THREE.DodecahedronGeometry(0.24, 1), boneMat);
@@ -2407,7 +2421,7 @@ export function buildEntityMesh(entity: LevelEntity): THREE.Group {
           metalness: 0.85,
         });
         const ceramicMat = new THREE.MeshStandardMaterial({ color: '#5D4E6D', roughness: 0.45, metalness: 0.2 });
-        const ped = new THREE.Mesh(new THREE.BoxGeometry(0.68, 0.34, 0.68), slateMat);
+        const ped = new THREE.Mesh(new THREE.BoxGeometry(0.68, 0.34, 0.68, 4, 2, 4), slateMat);
         ped.position.y = 0.17;
         ped.castShadow = true;
         const body = new THREE.Mesh(new THREE.CylinderGeometry(0.28, 0.2, 0.56, 12), ceramicMat);
@@ -2421,10 +2435,10 @@ export function buildEntityMesh(entity: LevelEntity): THREE.Group {
         bellyBand.position.y = 0.62;
         group.add(ped, body, rim, bellyBand);
       } else if (isCrate) {
-        const box = new THREE.Mesh(new THREE.BoxGeometry(0.84, 0.84, 0.84), woodMat);
+        const box = new THREE.Mesh(new THREE.BoxGeometry(0.84, 0.84, 0.84, 4, 4, 4), woodMat);
         box.position.y = 0.42;
         box.castShadow = true;
-        const brace = new THREE.Mesh(new THREE.BoxGeometry(0.88, 0.12, 0.88), ironMat);
+        const brace = new THREE.Mesh(new THREE.BoxGeometry(0.88, 0.12, 0.88, 4, 2, 4), ironMat);
         brace.position.y = 0.42;
         group.add(box, brace);
       } else {
@@ -2495,9 +2509,9 @@ export function buildEntityMesh(entity: LevelEntity): THREE.Group {
       }
       addShadow(0.35);
       const woodMat = new THREE.MeshStandardMaterial({ color: '#9C6838', roughness: 0.8 });
-      const post = new THREE.Mesh(new THREE.CylinderGeometry(0.07, 0.08, 0.9, 8), woodMat);
+      const post = new THREE.Mesh(new THREE.CylinderGeometry(0.07, 0.08, 0.9, 10, 4), woodMat);
       post.position.y = 0.45;
-      const board = new THREE.Mesh(new THREE.BoxGeometry(0.92, 0.52, 0.1), woodMat);
+      const board = new THREE.Mesh(new THREE.BoxGeometry(0.92, 0.52, 0.1, 6, 4, 2), woodMat);
       board.position.y = 0.96;
       board.castShadow = true;
       group.add(post, board);

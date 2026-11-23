@@ -488,6 +488,7 @@ export function getLevelWallBoxes(level?: Partial<GameLevel> | null): WallCollid
 export interface CollisionFilterContext {
   choppedTreeIds?: ReadonlySet<string>;
   openedDoorIds?: ReadonlySet<string>;
+  actorY?: number;
 }
 
 interface CircleCollider {
@@ -500,6 +501,8 @@ interface CircleCollider {
   doorId?: string;
   /** True for door side pillars that remain solid after door opens; false for main closed door leaf */
   openOnly?: boolean;
+  minY?: number;
+  maxY?: number;
   stamp: number;
 }
 
@@ -512,6 +515,8 @@ interface ObbCollider {
   hw: number;
   hd: number;
   doorId?: string;
+  minY?: number;
+  maxY?: number;
   stamp: number;
 }
 
@@ -579,7 +584,7 @@ function addCircleCollider(
   x: number,
   z: number,
   r: number,
-  extra?: Partial<Pick<CircleCollider, 'stumpR' | 'treeId' | 'doorId' | 'openOnly'>>
+  extra?: Partial<Pick<CircleCollider, 'stumpR' | 'treeId' | 'doorId' | 'openOnly' | 'minY' | 'maxY'>>
 ): void {
   if (r <= 0.01) return;
   const col: CircleCollider = { kind: 'circle', x, z, r, stamp: 0, ...extra };
@@ -593,14 +598,16 @@ function addObbCollider(
   yawRad: number,
   hw: number,
   hd: number,
-  doorId?: string
+  doorId?: string,
+  minY?: number,
+  maxY?: number
 ): void {
   if (hw <= 0.01 || hd <= 0.01) return;
   const cos = Math.cos(yawRad);
   const sin = Math.sin(yawRad);
   const extX = Math.abs(hw * cos) + Math.abs(hd * sin);
   const extZ = Math.abs(hw * sin) + Math.abs(hd * cos);
-  const col: ObbCollider = { kind: 'obb', x, z, cos, sin, hw, hd, doorId, stamp: 0 };
+  const col: ObbCollider = { kind: 'obb', x, z, cos, sin, hw, hd, doorId, minY, maxY, stamp: 0 };
   insertColliderIntoGrid(cells, col, x - extX, x + extX, z - extZ, z + extZ);
 }
 
@@ -677,22 +684,71 @@ function buildLevelColliderGrid(level: GameLevel): CachedLevelColliderGrid {
       const s = Math.max(0.25, ent.scale ?? 1);
       const [wx, wz] = levelBoardToWorld(level, ent.position);
       const yaw = ((ent.rotation ?? 0) * Math.PI) / 180;
+      const baseY = sampleLevelHeight(level, wx, wz) + (ent.elevationY ?? 0);
+
+      if (ent.buildingBlock) {
+        const shape = ent.buildingBlock.shape;
+        if (shape === 'floorTile' || shape === 'stairsStraight' || shape === 'trapdoor' || shape === 'wallTorch') {
+          continue; // Walkable surfaces / wall sconces
+        }
+        if (shape === 'wallCube') {
+          addObbCollider(cells, wx, wz, yaw, 1.0 * s, 1.0 * s, undefined, baseY, baseY + 2.0 * s);
+        } else if (shape === 'halfWall') {
+          addObbCollider(cells, wx, wz, yaw, 1.0 * s, 0.35 * s, undefined, baseY, baseY + 1.0 * s);
+        } else if (shape === 'pillar') {
+          addCircleCollider(cells, wx, wz, 0.42 * s, { minY: baseY, maxY: baseY + 2.0 * s });
+        } else if (shape === 'windowWall') {
+          addObbCollider(cells, wx, wz, yaw, 1.0 * s, 0.28 * s, undefined, baseY, baseY + 2.0 * s);
+        } else if (shape === 'archway') {
+          const cos = Math.cos(yaw);
+          const sin = Math.sin(yaw);
+          addObbCollider(
+            cells,
+            wx - 0.8 * s * cos,
+            wz + 0.8 * s * sin,
+            yaw,
+            0.22 * s,
+            0.36 * s,
+            undefined,
+            baseY,
+            baseY + 2.2 * s
+          );
+          addObbCollider(
+            cells,
+            wx + 0.8 * s * cos,
+            wz - 0.8 * s * sin,
+            yaw,
+            0.22 * s,
+            0.36 * s,
+            undefined,
+            baseY,
+            baseY + 2.2 * s
+          );
+        } else if (shape === 'stairsSpiral') {
+          addCircleCollider(cells, wx, wz, 0.25 * s, { minY: baseY, maxY: baseY + 2.1 * s });
+        }
+        continue;
+      }
 
       if (ent.kind === 'scenery') {
         const trunkMult = ent.canopyTree?.trunkThickness ?? 1;
         addCircleCollider(cells, wx, wz, 0.45 * s * trunkMult);
       } else if (ent.kind === 'door') {
         // Closed door blocks full archway; once opened, only side stone pillars remain solid
-        addObbCollider(cells, wx, wz, yaw, 0.96 * s, 0.26 * s, ent.id);
+        addObbCollider(cells, wx, wz, yaw, 0.96 * s, 0.26 * s, ent.id, baseY, baseY + 2.2 * s);
         const cos = Math.cos(yaw);
         const sin = Math.sin(yaw);
-        addCircleCollider(cells, wx - 0.94 * s * cos, wz + 0.94 * s * sin, 0.2 * s, {
+        addCircleCollider(cells, wx - 0.86 * s * cos, wz + 0.86 * s * sin, 0.2 * s, {
           doorId: ent.id,
           openOnly: true,
+          minY: baseY,
+          maxY: baseY + 2.2 * s,
         });
-        addCircleCollider(cells, wx + 0.94 * s * cos, wz - 0.94 * s * sin, 0.2 * s, {
+        addCircleCollider(cells, wx + 0.86 * s * cos, wz - 0.86 * s * sin, 0.2 * s, {
           doorId: ent.id,
           openOnly: true,
+          minY: baseY,
+          maxY: baseY + 2.2 * s,
         });
       } else if (ent.kind === 'prop') {
         const preset = inferPropPresetForCollision(ent.name, ent.propPreset);
@@ -794,6 +850,12 @@ function resolveGridObstacles(
             const isOpen = context?.openedDoorIds?.has(col.doorId) ?? false;
             if (col.kind === 'obb' && isOpen) continue;
             if (col.kind === 'circle' && col.openOnly && !isOpen) continue;
+          }
+
+          if (context?.actorY !== undefined && col.minY !== undefined && col.maxY !== undefined) {
+            if (context.actorY >= col.maxY - 0.15 || context.actorY + 1.55 <= col.minY) {
+              continue;
+            }
           }
 
           if (col.kind === 'circle') {
@@ -1515,6 +1577,10 @@ export function applyMountainCaveToTerrain(terrain: TerrainData): TerrainData {
     ...terrain,
     heights: nextHeights,
     layers: nextLayers,
+    weathering:
+      terrain.weathering && terrain.weathering.length === width * width
+        ? terrain.weathering
+        : undefined,
     scatter: nextScatter,
     caves: nextCaves,
     revision: (terrain.revision ?? 1) + 1,
@@ -1711,6 +1777,81 @@ export function sampleLevelHeight(level: GameLevel, x: number, z: number): numbe
   return h;
 }
 
+export interface TerrainWeatherSample {
+  moss: number;
+  cracks: number;
+  scorch: number;
+  mud: number;
+  frost: number;
+}
+
+export function packTerrainWeathering(
+  moss: number,
+  cracks: number,
+  scorch: number,
+  mud: number,
+  frost: number
+): number {
+  const m = Math.max(0, Math.min(63, Math.round(moss * 63)));
+  const c = Math.max(0, Math.min(63, Math.round(cracks * 63)));
+  const s = Math.max(0, Math.min(63, Math.round(scorch * 63)));
+  const d = Math.max(0, Math.min(63, Math.round(mud * 63)));
+  const f = Math.max(0, Math.min(63, Math.round(frost * 63)));
+  return m | (c << 6) | (s << 12) | (d << 18) | (f << 24);
+}
+
+export function unpackTerrainWeathering(packed: number | undefined): TerrainWeatherSample {
+  if (!packed) return { moss: 0, cracks: 0, scorch: 0, mud: 0, frost: 0 };
+  return {
+    moss: (packed & 63) / 63,
+    cracks: ((packed >>> 6) & 63) / 63,
+    scorch: ((packed >>> 12) & 63) / 63,
+    mud: ((packed >>> 18) & 63) / 63,
+    frost: ((packed >>> 24) & 63) / 63,
+  };
+}
+
+export function sampleTerrainWeathering(
+  terrain: TerrainData | undefined,
+  x: number,
+  z: number
+): TerrainWeatherSample {
+  if (
+    !terrain?.weathering ||
+    terrain.weathering.length !== (terrain.size + 1) * (terrain.size + 1)
+  ) {
+    return { moss: 0, cracks: 0, scorch: 0, mud: 0, frost: 0 };
+  }
+  const size = terrain.size;
+  const width = size + 1;
+  const r = IslandTerrain.radius;
+  const fx = Math.max(0, Math.min(size - 0.0001, ((x + r) / (2 * r)) * size));
+  const fz = Math.max(0, Math.min(size - 0.0001, ((z + r) / (2 * r)) * size));
+  const c0 = Math.floor(fx);
+  const r0 = Math.floor(fz);
+  const c1 = Math.min(size, c0 + 1);
+  const r1 = Math.min(size, r0 + 1);
+  const tx = fx - c0;
+  const tz = fz - r0;
+
+  const wArr = terrain.weathering;
+  const s00 = unpackTerrainWeathering(wArr[r0 * width + c0]);
+  const s10 = unpackTerrainWeathering(wArr[r0 * width + c1]);
+  const s01 = unpackTerrainWeathering(wArr[r1 * width + c0]);
+  const s11 = unpackTerrainWeathering(wArr[r1 * width + c1]);
+
+  const bilerp = (a: number, b: number, c: number, d: number) =>
+    (a + (b - a) * tx) * (1 - tz) + (c + (d - c) * tx) * tz;
+
+  return {
+    moss: bilerp(s00.moss, s10.moss, s01.moss, s11.moss),
+    cracks: bilerp(s00.cracks, s10.cracks, s01.cracks, s11.cracks),
+    scorch: bilerp(s00.scorch, s10.scorch, s01.scorch, s11.scorch),
+    mud: bilerp(s00.mud, s10.mud, s01.mud, s11.mud),
+    frost: bilerp(s00.frost, s10.frost, s01.frost, s11.frost),
+  };
+}
+
 export function applyTerrainBrush(
   rawTerrain: TerrainData,
   brush: TerrainBrush,
@@ -1865,6 +2006,100 @@ export function applyTerrainBrush(
     };
   }
 
+  const isWeatherBrush =
+    brush === 'weatherMoss' ||
+    brush === 'weatherCracks' ||
+    brush === 'weatherErode' ||
+    brush === 'weatherScorch' ||
+    brush === 'weatherMud' ||
+    brush === 'weatherFrost' ||
+    brush === 'weatherClear';
+
+  if (isWeatherBrush) {
+    const cellCount = width * width;
+    const updatedWeather =
+      terrain.weathering && terrain.weathering.length === cellCount
+        ? [...terrain.weathering]
+        : new Array<number>(cellCount).fill(0);
+    const updatedHeights = brush === 'weatherErode' ? [...terrain.heights] : null;
+    const baseHeights = terrain.heights;
+
+    for (let row = minRow; row <= maxRow; row++) {
+      for (let col = minCol; col <= maxCol; col++) {
+        const vx = -worldRadius + col * step;
+        const vz = -worldRadius + row * step;
+        const distance = Math.hypot(vx - x, vz - z);
+        if (distance > radius) continue;
+        const soft = evaluateBrushFalloff(distance / radius, falloffMode);
+        const idx = row * width + col;
+
+        // Estimate local cliff slope for realistic rock/cave weathering
+        const cLt = Math.max(0, col - 1);
+        const cRt = Math.min(size, col + 1);
+        const rUp = Math.max(0, row - 1);
+        const rDn = Math.min(size, row + 1);
+        const gx = (baseHeights[row * width + cRt] - baseHeights[row * width + cLt]) / (2 * step);
+        const gz = (baseHeights[rDn * width + col] - baseHeights[rUp * width + col]) / (2 * step);
+        const slope = Math.min(1, Math.hypot(gx, gz) * 0.9);
+
+        const cur = unpackTerrainWeathering(updatedWeather[idx]);
+        let { moss, cracks, scorch, mud, frost } = cur;
+        const rate = Math.min(0.92, soft * strength * 0.48);
+
+        if (brush === 'weatherMoss') {
+          const slopeBias = 0.72 + (1 - slope) * 0.28;
+          moss = Math.min(1, moss + (1 - moss) * rate * slopeBias);
+          frost = Math.max(0, frost * (1 - rate * 0.5));
+          scorch = Math.max(0, scorch * (1 - rate * 0.35));
+        } else if (brush === 'weatherCracks') {
+          const slopeBoost = 0.8 + slope * 0.55;
+          cracks = Math.min(1, cracks + (1 - cracks) * rate * slopeBoost);
+        } else if (brush === 'weatherErode') {
+          const slopeBoost = 0.85 + slope * 0.65;
+          cracks = Math.min(1, cracks + (1 - cracks) * rate * slopeBoost);
+          if (slope < 0.38 && baseHeights[idx] < IslandTerrain.waterLevel + 2.2) {
+            mud = Math.min(1, mud + (1 - mud) * rate * 0.28);
+          }
+          if (updatedHeights) {
+            // Chisel layered strata grooves & chipped rock notches onto cliff/cave/hill slopes
+            const cragNoise =
+              Math.sin(vx * 0.95 + Math.cos(vz * 0.75) * 1.4) * Math.cos(vz * 1.05 - vx * 0.45) +
+              Math.sin(vx * 2.1 - vz * 1.9 + baseHeights[idx] * 0.8) * 0.45;
+            const sculptScale = soft * strength * (0.09 + slope * 0.24);
+            const etched = baseHeights[idx] + (cragNoise * 0.55 - 0.22) * sculptScale;
+            updatedHeights[idx] = Math.max(-4.2, Math.min(24, etched));
+          }
+        } else if (brush === 'weatherScorch') {
+          scorch = Math.min(1, scorch + (1 - scorch) * rate * 1.05);
+          moss = Math.max(0, moss * (1 - rate * 0.65));
+          frost = Math.max(0, frost * (1 - rate * 0.75));
+        } else if (brush === 'weatherMud') {
+          mud = Math.min(1, mud + (1 - mud) * rate);
+          frost = Math.max(0, frost * (1 - rate * 0.55));
+        } else if (brush === 'weatherFrost') {
+          frost = Math.min(1, frost + (1 - frost) * rate);
+          scorch = Math.max(0, scorch * (1 - rate * 0.55));
+        } else if (brush === 'weatherClear') {
+          const clearMul = Math.max(0, 1 - rate * 1.35);
+          moss *= clearMul;
+          cracks *= clearMul;
+          scorch *= clearMul;
+          mud *= clearMul;
+          frost *= clearMul;
+        }
+
+        updatedWeather[idx] = packTerrainWeathering(moss, cracks, scorch, mud, frost);
+      }
+    }
+
+    return {
+      ...terrain,
+      heights: updatedHeights ?? terrain.heights,
+      weathering: updatedWeather,
+      revision: terrain.revision + 1,
+    };
+  }
+
   const paintIdx = paintLayerMap[brush];
   if (paintIdx !== undefined) {
     const updated = [...terrain.layers];
@@ -1928,6 +2163,103 @@ export function applyTerrainBrush(
     });
   }
   return { ...terrain, scatter: nextScatter, revision: terrain.revision + 1 };
+}
+
+/**
+ * Automatically applies organic multi-form weathering across hills, mountain cliffs, riverbanks,
+ * and cave sides based on local slope, elevation, and distance to water or caves.
+ */
+export function applySlopeAutoWeathering(
+  rawTerrain: TerrainData,
+  degree = 0.72
+): TerrainData {
+  const terrain = ensureUpgradedTerrain(rawTerrain);
+  const size = terrain.size;
+  const width = size + 1;
+  const worldRadius = IslandTerrain.radius;
+  const step = (2 * worldRadius) / size;
+  const cellCount = width * width;
+  const existing =
+    terrain.weathering && terrain.weathering.length === cellCount
+      ? terrain.weathering
+      : null;
+  const nextWeather = new Array<number>(cellCount);
+  const caves = terrain.caves ?? [];
+  const scale = Math.max(0.15, Math.min(1.25, degree));
+
+  for (let row = 0; row < width; row++) {
+    const rUp = Math.max(0, row - 1);
+    const rDn = Math.min(size, row + 1);
+    const vz = -worldRadius + row * step;
+    for (let col = 0; col < width; col++) {
+      const cLt = Math.max(0, col - 1);
+      const cRt = Math.min(size, col + 1);
+      const vx = -worldRadius + col * step;
+      const idx = row * width + col;
+      const h = terrain.heights[idx];
+
+      const gx = (terrain.heights[row * width + cRt] - terrain.heights[row * width + cLt]) / (2 * step);
+      const gz = (terrain.heights[rDn * width + col] - terrain.heights[rUp * width + col]) / (2 * step);
+      const slope = Math.min(1, Math.hypot(gx, gz) * 0.85);
+      const patch = (organicMossPatch(vx * 1.4, vz * 1.4) + 1) * 0.5;
+      const rDist = IslandRiver.distanceTo(vx, vz);
+
+      let nearCave = 0;
+      for (let ci = 0; ci < caves.length; ci++) {
+        const cd = Math.hypot(vx - caves[ci].x, vz - caves[ci].z);
+        if (cd < 16) {
+          nearCave = Math.max(nearCave, 1 - cd / 16);
+        }
+      }
+
+      const prev = existing ? unpackTerrainWeathering(existing[idx]) : { moss: 0, cracks: 0, scorch: 0, mud: 0, frost: 0 };
+
+      // Steep cliff faces, ridges & cave surrounds get fractured stone cracks
+      const cliffCracks =
+        slope > 0.28 || nearCave > 0.15 || h > 6.5
+          ? Math.min(0.9, ((slope - 0.2) * 0.85 + nearCave * 0.55 + Math.max(0, h - 6.5) * 0.04) * (0.55 + patch * 0.55) * scale)
+          : 0;
+
+      // Damp riverbanks, cave approaches & shaded lower slopes gather moss
+      const bankMoss =
+        h > IslandTerrain.waterLevel + 0.1 && (rDist < 9.5 || nearCave > 0.2 || (slope > 0.18 && slope < 0.58 && patch > 0.45))
+          ? Math.min(0.85, (Math.max(0, 1 - rDist / 10) * 0.55 + nearCave * 0.45 + patch * 0.35) * scale)
+          : 0;
+
+      // Wet mud along low shorelines and river edges
+      const shoreMud =
+        h >= IslandTerrain.waterLevel - 0.35 && h <= IslandTerrain.waterLevel + 1.15 && (rDist < 7.5 || patch > 0.42)
+          ? Math.min(0.75, (0.45 + patch * 0.4) * scale)
+          : 0;
+
+      // High-altitude frost on tall mountain summits
+      const peakFrost = h > 10.5 ? Math.min(0.85, ((h - 10.5) / 6.5) * (0.65 + patch * 0.35) * scale) : 0;
+
+      nextWeather[idx] = packTerrainWeathering(
+        Math.max(prev.moss, bankMoss),
+        Math.max(prev.cracks, cliffCracks),
+        prev.scorch,
+        Math.max(prev.mud, shoreMud),
+        Math.max(prev.frost, peakFrost)
+      );
+    }
+  }
+
+  return {
+    ...terrain,
+    weathering: nextWeather,
+    revision: terrain.revision + 1,
+  };
+}
+
+export function clearTerrainWeathering(rawTerrain: TerrainData): TerrainData {
+  const terrain = ensureUpgradedTerrain(rawTerrain);
+  if (!terrain.weathering) return terrain;
+  return {
+    ...terrain,
+    weathering: undefined,
+    revision: terrain.revision + 1,
+  };
 }
 
 export const PlatformMotion = {

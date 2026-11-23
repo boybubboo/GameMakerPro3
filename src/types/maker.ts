@@ -235,7 +235,17 @@ export interface CustomTextureAssetMeta {
   createdAt: string;
 }
 
-export type WeatheringPreset = 'none' | 'moss' | 'snow' | 'wet';
+export type WeatheringPreset =
+  | 'none'
+  | 'moss'
+  | 'snow'
+  | 'wet'
+  | 'cracked'
+  | 'chipped'
+  | 'scorched'
+  | 'muddy'
+  | 'bleached'
+  | 'rusted';
 
 export interface EntityMaterialVariant {
   enabled?: boolean;
@@ -244,6 +254,7 @@ export interface EntityMaterialVariant {
   diffuseRoughness?: number;
   weathering?: WeatheringPreset;
   weatheringIntensity?: number;
+  wearFactor?: number;
 }
 
 export interface SurfaceTextureSettings {
@@ -293,7 +304,7 @@ export interface ExportedTextureBundle {
   base64Image: string;
 }
 
-export type VertexPaintMode = 'paint' | 'hueShift' | 'organicJitter' | 'erase';
+export type VertexPaintMode = 'paint' | 'hueShift' | 'organicJitter' | 'degrade' | 'erase';
 export type VertexPaintTarget = 'all' | 'leaves' | 'branches';
 
 export interface VertexPaintStroke {
@@ -318,6 +329,10 @@ export interface VertexPaintStroke {
   valueShift?: number;
   /** Organic per-vertex random hue scatter in degrees (0..90) */
   hueJitter?: number;
+  /** Weathering / degradation form applied when mode === 'degrade' */
+  degradeForm?: WeatheringPreset;
+  /** Physical vertex dent / chip depth (0..1) when degrading stone/wood geometry */
+  degradeChipDepth?: number;
   seed: number;
 }
 
@@ -433,6 +448,51 @@ export type DriverTypeId = 'ranger' | 'stunt' | 'skunk' | 'bot';
 export type DrivingCameraView = 'driverPov' | 'closeChase' | 'farChase';
 
 export type GameplayMode = 'adventure' | 'buddies' | 'driving' | 'roguelike';
+
+export type BuildingShapeId =
+  | 'wallCube'
+  | 'halfWall'
+  | 'pillar'
+  | 'floorTile'
+  | 'stairsStraight'
+  | 'stairsSpiral'
+  | 'archway'
+  | 'windowWall'
+  | 'trapdoor'
+  | 'wallTorch';
+
+export type BuildingMaterialId =
+  | 'hewnStone'
+  | 'randomCobble'
+  | 'squareFlagstone'
+  | 'crackedSlate'
+  | 'masonryBrick'
+  | 'packedDirt'
+  | 'timberPlank'
+  | 'roundLogs'
+  | 'rustedIron';
+
+export interface BuildingBlockConfig {
+  shape: BuildingShapeId;
+  material: BuildingMaterialId;
+  archStyle?: 'arched' | 'rectangular';
+  windowStyle?: 'open' | 'barred' | 'shuttered';
+  requiresKey?: boolean;
+}
+
+export type DoorFrameShape = 'rectangular' | 'arched';
+export type DoorLeafStyle = 'woodPlank' | 'solidMetal' | 'ironBars' | 'jailCage';
+export type DoorOpenMode = 'hingedSide' | 'doubleSplit' | 'sliding';
+export type DoorSlotStyle = 'none' | 'peepSlot' | 'barredWindow';
+
+export interface DoorConfig {
+  frameShape: DoorFrameShape;
+  leafStyle: DoorLeafStyle;
+  openMode: DoorOpenMode;
+  slotStyle: DoorSlotStyle;
+  frameMaterial?: BuildingMaterialId;
+  requiresKey?: boolean;
+}
 
 export interface WallColliderBox {
   minX: number;
@@ -1057,6 +1117,10 @@ export interface LevelEntity {
   puzzleRewardText?: string;
   puzzleFlag?: string;
   checkpointOrder?: number;
+  // Modular Dungeon & Masonry Building Kit
+  elevationY?: number;
+  buildingBlock?: BuildingBlockConfig;
+  doorConfig?: DoorConfig;
   // WebGPU r187 pipeline & zero-stutter material variant overrides
   meshletEnabled?: boolean;
   materialVariant?: EntityMaterialVariant;
@@ -1152,6 +1216,13 @@ export type TerrainBrush =
   | 'paintSand'
   | 'paintRock'
   | 'paintSnow'
+  | 'weatherMoss'
+  | 'weatherCracks'
+  | 'weatherErode'
+  | 'weatherScorch'
+  | 'weatherMud'
+  | 'weatherFrost'
+  | 'weatherClear'
   | 'scatterTree'
   | 'scatterRock'
   | 'scatterFlower'
@@ -1202,6 +1273,8 @@ export interface TerrainData {
   size: number; // 64 (or legacy 48 auto-migrated)
   heights: number[]; // (size+1)*(size+1)
   layers: number[]; // 0=grass, 1=sand, 2=rock, 3=snow, 4=moss, 5=cobble
+  /** Optional packed 5-channel weathering/degradation grid (moss, cracks, scorch, mud, frost) */
+  weathering?: number[];
   scatter: ScatterItem[];
   caves?: CaveGrotto[];
   revision: number;

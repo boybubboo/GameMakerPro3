@@ -11,11 +11,11 @@ import {
 } from 'lucide-react';
 import type { MakerStore } from '../../store/useMakerStore';
 import { createDefaultSurfaceTextureSettings } from '../../three/customTextureManager';
+import { WEATHERING_PRESETS } from '../../three/nodeMaterialUtils';
 import type {
   CustomTextureResolution,
   SceneryTextureSlot,
   SurfaceTextureSettings,
-  WeatheringPreset,
 } from '../../types/maker';
 
 interface SliderControlProps {
@@ -556,25 +556,30 @@ export const SurfaceTextureControls: React.FC<SurfaceTextureControlsProps> = ({
               onChange={(v) => patch({ diffuseRoughness: v })}
             />
 
-            <div className="space-y-1">
+            <div className="col-span-2 space-y-1">
               <div className="text-[11px] font-semibold text-slate-600 dark:text-slate-300">
-                Weathering
+                Weathering / Degrading Form
               </div>
-              <div className="grid grid-cols-4 gap-1">
-                {(['none', 'moss', 'snow', 'wet'] as WeatheringPreset[]).map((wp) => {
-                  const active = (settings.weathering ?? 'none') === wp;
+              <div className="grid grid-cols-5 gap-1">
+                {WEATHERING_PRESETS.map((wp) => {
+                  const active = (settings.weathering ?? 'none') === wp.id;
                   return (
                     <button
-                      key={wp}
+                      key={wp.id}
                       type="button"
-                      onClick={() => patch({ weathering: wp }, true)}
-                      className={`py-1 rounded-lg text-[10px] font-bold capitalize border transition-colors ${
+                      title={wp.shortDesc}
+                      onClick={() => patch({ weathering: wp.id }, true)}
+                      className={`flex items-center justify-center gap-1 py-1 px-1 rounded-lg text-[10px] font-bold border transition-colors ${
                         active
                           ? 'bg-[#20B46A]/18 border-[#20B46A] text-[#20B46A]'
                           : 'bg-white dark:bg-[#171A23] border-slate-200/80 dark:border-white/[0.08] text-slate-500 dark:text-slate-300'
                       }`}
                     >
-                      {wp}
+                      <span
+                        className="w-2 h-2 rounded-full border border-black/20 shrink-0"
+                        style={{ backgroundColor: wp.swatch }}
+                      />
+                      <span className="truncate">{wp.label}</span>
                     </button>
                   );
                 })}

@@ -28,11 +28,15 @@ import type {
   AssetCategory,
   BehaviorCard,
   BoardPoint,
+  BuildingBlockConfig,
+  BuildingMaterialId,
+  BuildingShapeId,
   BuiltinMechanismTemplate,
   CraftingRecipe,
   CustomAssetMeta,
   CustomTextureAssetMeta,
   CustomTextureResolution,
+  DoorConfig,
   EntityKind,
   EntitySection,
   ExportedAssetBundle,
@@ -66,6 +70,7 @@ import type {
   VisualStyleId,
   WidgetKind,
 } from '../types/maker';
+import { BUILDING_SHAPES, DEFAULT_DOOR_CONFIG } from '../three/buildingBlocks';
 
 type LiveTelemetryListener = (telemetry: PlayerTelemetry | null) => void;
 let currentLivePlayerTelemetry: PlayerTelemetry | null = null;
@@ -120,10 +125,17 @@ import {
   savePresetRecord,
 } from '../utils/presetVault';
 import {
+  buildProjectZipArchive,
   compressMakerBundle,
+  isZipArchiveFile,
   readMakerFileAsText,
+  readMakerZipAsBundleText,
   triggerBlobDownload,
   type CompressedMakerResult,
+  type ZipAssetEntry,
+  type ZipProjectExportResult,
+  type ZipTextureEntry,
+  type ZipVoiceEntry,
 } from '../utils/makerArchive';
 import {
   applyLushGroundFloraToTerrain,
@@ -399,6 +411,7 @@ export function useMakerStore() {
   const [rehearseSkitId, setRehearseSkitId] = useState<string | null>(null);
 
   const [worldTool, setWorldTool] = useState<ViewportTool>('move');
+  const [worldGridSnap, setWorldGridSnap] = useState<0 | 1 | 2>(1);
   const [terrainBrush, setTerrainBrush] = useState<TerrainBrush>('raiseGround');
   const [terrainBrushRadius, setTerrainBrushRadius] = useState<number>(5.5);
   const [terrainBrushStrength, setTerrainBrushStrength] = useState<number>(0.75);
@@ -466,7 +479,7 @@ export function useMakerStore() {
   }, [currentProjectID, selectedLevelID]);
 
   const flushProjectsToStorage = useCallback((force = false) => {
-    if (!persistDirtyRef.current) return;
+    if (!force && !persistDirtyRef.current) return;
     if (!force && isPlayingRef.current) return;
     persistDirtyRef.current = false;
     try {
@@ -924,6 +937,61 @@ export function useMakerStore() {
     [updateLevel]
   );
 
+  const addBuildingBlockEntity = useCallback(
+    (
+      shapeOrDoor: BuildingShapeId | 'door',
+      material: BuildingMaterialId,
+      pos: { x: number; y: number },
+      opts: {
+        elevationY?: number;
+        rotation?: number;
+        name?: string;
+        doorConfig?: DoorConfig;
+        buildingBlockPatch?: Partial<BuildingBlockConfig>;
+      } = {}
+    ) => {
+      if (shapeOrDoor === 'door') {
+        const doorCfg: DoorConfig = {
+          ...DEFAULT_DOOR_CONFIG,
+          frameMaterial: material,
+          ...opts.doorConfig,
+        };
+        const entity = createEntity('door', opts.name ?? 'Dungeon Door', pos.x, pos.y, {
+          rotation: opts.rotation ?? 0,
+          elevationY: opts.elevationY,
+          doorConfig: doorCfg,
+        });
+        updateLevel(`place ${entity.name}`, (lvl) => ({
+          ...lvl,
+          entities: [...lvl.entities, entity],
+        }));
+        setSelectedEntityID(entity.id);
+        return entity;
+      }
+
+      const shapeMeta = BUILDING_SHAPES.find((s) => s.id === shapeOrDoor) ?? BUILDING_SHAPES[0];
+      const kind: EntityKind = shapeOrDoor === 'wallTorch' ? 'light' : 'prop';
+      const entity = createEntity(kind, opts.name ?? shapeMeta.defaultName, pos.x, pos.y, {
+        rotation: opts.rotation ?? 0,
+        elevationY: opts.elevationY,
+        buildingBlock: {
+          shape: shapeOrDoor,
+          material,
+          ...(shapeOrDoor === 'archway' ? { archStyle: 'arched' } : {}),
+          ...(shapeOrDoor === 'windowWall' ? { windowStyle: 'barred' } : {}),
+          ...opts.buildingBlockPatch,
+        },
+      });
+      updateLevel(`place ${entity.name}`, (lvl) => ({
+        ...lvl,
+        entities: [...lvl.entities, entity],
+      }));
+      setSelectedEntityID(entity.id);
+      return entity;
+    },
+    [updateLevel]
+  );
+
   const addFxTemplateAtPoint = useCallback(
     (template: FxLibraryTemplate, position?: { x: number; y: number }) => {
       const basePos = position ?? { x: 0.5, y: 0.5 };
@@ -1084,8 +1152,17 @@ export function useMakerStore() {
   );
 
   const moveEntity = useCallback(
-    (id: string, pos: { x: number; y: number }, recordUndo = false) => {
-      updateEntity(id, 'move item', (e) => ({ ...e, position: pos }), recordUndo);
+    (id: string, pos: { x: number; y: number }, recordUndo = false, elevationY?: number) => {
+      updateEntity(
+        id,
+        'move item',
+        (e) => ({
+          ...e,
+          position: pos,
+          ...(elevationY !== undefined ? { elevationY } : {}),
+        }),
+        recordUndo
+      );
     },
     [updateEntity]
   );
@@ -1404,47 +1481,57 @@ export function useMakerStore() {
     [updateProject]
   );
 
+  const collectProjectResourceIds = useCallback((project: GameProject) => {
+    const usedIds = new Set<string>();
+    const usedTexIds = new Set<string>();
+    if (project.heroCustomAssetId) usedIds.add(project.heroCustomAssetId);
+    for (const lvl of project.levels) {
+      if (lvl.canopyEngine?.canopyAssetId) usedIds.add(lvl.canopyEngine.canopyAssetId);
+      if (lvl.canopyEngine?.trunkAssetId) usedIds.add(lvl.canopyEngine.trunkAssetId);
+      if (lvl.canopyEngine?.fruitAssetId) usedIds.add(lvl.canopyEngine.fruitAssetId);
+      if (lvl.canopyEngine?.speciesProfiles) {
+        for (const prof of Object.values(lvl.canopyEngine.speciesProfiles)) {
+          if (!prof) continue;
+          if (prof.canopyAssetId) usedIds.add(prof.canopyAssetId);
+          if (prof.trunkAssetId) usedIds.add(prof.trunkAssetId);
+          if (prof.fruitAssetId) usedIds.add(prof.fruitAssetId);
+        }
+      }
+      for (const ent of lvl.entities) {
+        if (ent.customAssetId) usedIds.add(ent.customAssetId);
+        if (ent.canopyTree?.canopyAssetId) usedIds.add(ent.canopyTree.canopyAssetId);
+        if (ent.canopyTree?.trunkAssetId) usedIds.add(ent.canopyTree.trunkAssetId);
+        if (ent.canopyTree?.fruitAssetId) usedIds.add(ent.canopyTree.fruitAssetId);
+        if (ent.fxEmitter?.customMeshAssetId) usedIds.add(ent.fxEmitter.customMeshAssetId);
+      }
+      for (const sc of lvl.terrain?.scatter ?? []) {
+        if (sc.customAssetId) usedIds.add(sc.customAssetId);
+      }
+      for (const vi of lvl.vistaItems ?? []) {
+        if (vi.customAssetId) usedIds.add(vi.customAssetId);
+      }
+      for (const tid of collectReferencedTextureIds(
+        lvl.sceneryTextures,
+        lvl.canopyEngine,
+        lvl.entities.map((e) => e.canopyTree)
+      )) {
+        usedTexIds.add(tid);
+      }
+    }
+    const usedVoiceIds = collectReferencedVoiceIds(project.levels, [
+      project.storybook?.prologueVoice,
+      project.storybook?.epilogueVoice,
+    ]);
+    return { usedIds, usedTexIds, usedVoiceIds };
+  }, []);
+
   const exportProjectJSON = useCallback(
     async (project: GameProject, includeAssets = true): Promise<string> => {
       const assets: ExportedAssetBundle[] = [];
       const textures: ExportedTextureBundle[] = [];
+      const voiceOvers: ExportedVoiceBundle[] = [];
       if (includeAssets) {
-        const usedIds = new Set<string>();
-        const usedTexIds = new Set<string>();
-        if (project.heroCustomAssetId) usedIds.add(project.heroCustomAssetId);
-        for (const lvl of project.levels) {
-          if (lvl.canopyEngine?.canopyAssetId) usedIds.add(lvl.canopyEngine.canopyAssetId);
-          if (lvl.canopyEngine?.trunkAssetId) usedIds.add(lvl.canopyEngine.trunkAssetId);
-          if (lvl.canopyEngine?.fruitAssetId) usedIds.add(lvl.canopyEngine.fruitAssetId);
-          if (lvl.canopyEngine?.speciesProfiles) {
-            for (const prof of Object.values(lvl.canopyEngine.speciesProfiles)) {
-              if (!prof) continue;
-              if (prof.canopyAssetId) usedIds.add(prof.canopyAssetId);
-              if (prof.trunkAssetId) usedIds.add(prof.trunkAssetId);
-              if (prof.fruitAssetId) usedIds.add(prof.fruitAssetId);
-            }
-          }
-          for (const ent of lvl.entities) {
-            if (ent.customAssetId) usedIds.add(ent.customAssetId);
-            if (ent.canopyTree?.canopyAssetId) usedIds.add(ent.canopyTree.canopyAssetId);
-            if (ent.canopyTree?.trunkAssetId) usedIds.add(ent.canopyTree.trunkAssetId);
-            if (ent.canopyTree?.fruitAssetId) usedIds.add(ent.canopyTree.fruitAssetId);
-            if (ent.fxEmitter?.customMeshAssetId) usedIds.add(ent.fxEmitter.customMeshAssetId);
-          }
-          for (const sc of lvl.terrain?.scatter ?? []) {
-            if (sc.customAssetId) usedIds.add(sc.customAssetId);
-          }
-          for (const vi of lvl.vistaItems ?? []) {
-            if (vi.customAssetId) usedIds.add(vi.customAssetId);
-          }
-          for (const tid of collectReferencedTextureIds(
-            lvl.sceneryTextures,
-            lvl.canopyEngine,
-            lvl.entities.map((e) => e.canopyTree)
-          )) {
-            usedTexIds.add(tid);
-          }
-        }
+        const { usedIds, usedTexIds, usedVoiceIds } = collectProjectResourceIds(project);
         for (const assetId of usedIds) {
           const meta = customAssets.find((a) => a.id === assetId);
           if (!meta) continue;
@@ -1466,14 +1553,6 @@ export function useMakerStore() {
             base64Image: arrayBufferToBase64(rec.buffer),
           });
         }
-      }
-
-      const voiceOvers: ExportedVoiceBundle[] = [];
-      if (includeAssets) {
-        const usedVoiceIds = collectReferencedVoiceIds(project.levels, [
-          project.storybook?.prologueVoice,
-          project.storybook?.epilogueVoice,
-        ]);
         for (const vid of usedVoiceIds) {
           const meta = await getVoiceMeta(vid);
           const rec = await getVoiceBlobRecord(vid);
@@ -1501,7 +1580,7 @@ export function useMakerStore() {
       };
       return JSON.stringify(bundle, null, 2);
     },
-    [customAssets, customTextures]
+    [collectProjectResourceIds, customAssets, customTextures]
   );
 
   const importProjectJSON = useCallback(
@@ -1584,15 +1663,72 @@ export function useMakerStore() {
     [exportProjectJSON]
   );
 
+  const exportProjectZip = useCallback(
+    async (
+      project: GameProject,
+      opts?: { includeAssets?: boolean; sharedBy?: string }
+    ): Promise<ZipProjectExportResult> => {
+      const includeAssets = opts?.includeAssets ?? true;
+      const assets: ZipAssetEntry[] = [];
+      const textures: ZipTextureEntry[] = [];
+      const voiceOvers: ZipVoiceEntry[] = [];
+
+      if (includeAssets) {
+        const { usedIds, usedTexIds, usedVoiceIds } = collectProjectResourceIds(project);
+        for (const assetId of usedIds) {
+          const meta = customAssets.find((a) => a.id === assetId);
+          if (!meta) continue;
+          const buffer = await getAssetBlob(assetId);
+          if (!buffer) continue;
+          assets.push({ meta, buffer });
+        }
+        for (const texId of usedTexIds) {
+          const meta = customTextures.find((t) => t.id === texId);
+          if (!meta) continue;
+          const rec = await getTextureBlobRecord(texId);
+          if (!rec) continue;
+          textures.push({
+            meta,
+            mimeType: rec.mimeType,
+            buffer: rec.buffer,
+          });
+        }
+        for (const vid of usedVoiceIds) {
+          const meta = await getVoiceMeta(vid);
+          const rec = await getVoiceBlobRecord(vid);
+          if (!meta || !rec) continue;
+          voiceOvers.push({
+            meta,
+            mimeType: rec.mimeType || meta.mimeType,
+            buffer: rec.buffer,
+          });
+        }
+      }
+
+      const result = await buildProjectZipArchive({
+        project,
+        sharedBy: opts?.sharedBy,
+        assets,
+        textures,
+        voiceOvers,
+      });
+      triggerBlobDownload(result.blob, result.filename);
+      return result;
+    },
+    [collectProjectResourceIds, customAssets, customTextures]
+  );
+
   const importProjectFile = useCallback(
     async (file: File): Promise<{ ok: boolean; error?: string }> => {
       try {
-        const text = await readMakerFileAsText(file);
+        const text = (await isZipArchiveFile(file))
+          ? await readMakerZipAsBundleText(file)
+          : await readMakerFileAsText(file);
         return await importProjectJSON(text);
       } catch (err) {
         return {
           ok: false,
-          error: err instanceof Error ? err.message : 'Could not open that .maker file.',
+          error: err instanceof Error ? err.message : 'Could not open that game file.',
         };
       }
     },
@@ -2262,6 +2398,8 @@ export function useMakerStore() {
     setShowingTerrainEditor,
     worldTool,
     setWorldTool,
+    worldGridSnap,
+    setWorldGridSnap,
     terrainBrush,
     setTerrainBrush,
     terrainBrushRadius,
@@ -2345,6 +2483,7 @@ export function useMakerStore() {
     applyBrush,
     resetTerrain,
     addEntity,
+    addBuildingBlockEntity,
     addFxTemplateAtPoint,
     addCanopyTreeEntity,
     scatterCanopyGrove,
@@ -2391,7 +2530,9 @@ export function useMakerStore() {
     exportProjectJSON,
     importProjectJSON,
     exportCompressedMakerFile,
+    exportProjectZip,
     importProjectFile,
+    saveProjectStateNow: flushProjectsToStorage,
     issues,
     suggestions,
   };

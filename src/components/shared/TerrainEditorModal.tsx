@@ -15,13 +15,19 @@ import {
   Sparkles,
   Trees,
   Undo2,
+  Wand2,
   Waves,
   X,
 } from 'lucide-react';
 import type { MakerStore } from '../../store/useMakerStore';
 import type { GrassQuality, TerrainBrush, TerrainBrushFalloff } from '../../types/maker';
 import { resolveGrassConfig } from '../../three/stylizedGrassSystem';
-import { getEnvironmentType } from '../../utils/terrain';
+import {
+  applySlopeAutoWeathering,
+  clearTerrainWeathering,
+  createInitialTerrain,
+  getEnvironmentType,
+} from '../../utils/terrain';
 
 interface SculptBrushDef {
   id: TerrainBrush;
@@ -71,6 +77,16 @@ const PAINT_BRUSHES: { id: TerrainBrush; label: string; swatch: string }[] = [
   { id: 'paintCobble', label: 'Cobble', swatch: '#8E8B82' },
   { id: 'paintRock', label: 'Rock', swatch: '#6F737A' },
   { id: 'paintSnow', label: 'Snow', swatch: '#EBF2FA' },
+];
+
+const WEATHER_BRUSHES: { id: TerrainBrush; label: string; swatch: string; desc: string }[] = [
+  { id: 'weatherCracks', label: 'Cracks', swatch: '#57534E', desc: 'Fractured rock & fissures' },
+  { id: 'weatherErode', label: 'Erode Cliff', swatch: '#B45309', desc: 'Chisels & cracks slopes' },
+  { id: 'weatherMoss', label: 'Moss', swatch: '#4B8B3B', desc: 'Damp cave & slope lichen' },
+  { id: 'weatherScorch', label: 'Scorch', swatch: '#292524', desc: 'Ash & fire soot' },
+  { id: 'weatherMud', label: 'Damp Mud', swatch: '#6B4C35', desc: 'Muddy mire & rot' },
+  { id: 'weatherFrost', label: 'Frost', swatch: '#BAE6FD', desc: 'Rime frost & snow dust' },
+  { id: 'weatherClear', label: 'Clean', swatch: '#CBD5E1', desc: 'Wash away weathering' },
 ];
 
 const SCATTER_BRUSHES: { id: TerrainBrush; label: string; icon: React.ReactNode }[] = [
@@ -146,6 +162,20 @@ export function getTerrainBrushLabel(brush: TerrainBrush): string {
       return 'Rock';
     case 'paintSnow':
       return 'Snow';
+    case 'weatherMoss':
+      return 'Weather Moss';
+    case 'weatherCracks':
+      return 'Rock Cracks';
+    case 'weatherErode':
+      return 'Erode Cliff';
+    case 'weatherScorch':
+      return 'Scorch / Soot';
+    case 'weatherMud':
+      return 'Damp Mud';
+    case 'weatherFrost':
+      return 'Rime Frost';
+    case 'weatherClear':
+      return 'Clean Weathering';
     case 'scatterTree':
       return 'Trees';
     case 'scatterRock':
@@ -595,6 +625,79 @@ export const TerrainEditorModal: React.FC<{
                     </button>
                   );
                 })}
+              </div>
+            </section>
+
+            {/* Weather & Degrade Ground / Hills / Mountains / Caves */}
+            <section className="p-3 rounded-2xl bg-slate-50 dark:bg-[#1C212E] border border-slate-200/70 dark:border-white/[0.06] space-y-2.5">
+              <div className="flex items-center justify-between gap-2">
+                <div className="flex items-center gap-1.5">
+                  <Sparkles size={12} className="text-[#20B46A]" />
+                  <span className="text-[11px] font-extrabold uppercase tracking-wider text-slate-500 dark:text-[#8E96AB]">
+                    Weather &amp; Degrade Surfaces
+                  </span>
+                </div>
+                <span className="text-[10px] font-semibold text-slate-400 dark:text-[#7D859B]">
+                  Hills · Cliffs · Caves
+                </span>
+              </div>
+
+              <div className="grid grid-cols-3 gap-1.5">
+                {WEATHER_BRUSHES.map((wb) => {
+                  const active = store.worldTool === 'terrain' && activeBrush === wb.id;
+                  return (
+                    <button
+                      key={wb.id}
+                      type="button"
+                      title={wb.desc}
+                      onClick={() => selectBrush(wb.id)}
+                      className={`flex items-center gap-1.5 px-2 py-1.5 rounded-xl border text-[11px] font-bold transition-colors ${
+                        active
+                          ? 'border-[#20B46A] bg-[#20B46A]/18 text-[#20B46A]'
+                          : 'border-transparent bg-white dark:bg-[#151822] text-slate-600 dark:text-[#A8B1C6] hover:text-slate-900 dark:hover:text-white'
+                      }`}
+                    >
+                      <span
+                        className="w-3 h-3 rounded-full border border-black/20 shrink-0"
+                        style={{ backgroundColor: wb.swatch }}
+                      />
+                      <span className="truncate">{wb.label}</span>
+                    </button>
+                  );
+                })}
+              </div>
+
+              <div className="flex items-center gap-1.5 pt-0.5">
+                <button
+                  type="button"
+                  onClick={() =>
+                    store.updateLevel('auto-weather cliffs & caves', (lvl) => ({
+                      ...lvl,
+                      terrain: applySlopeAutoWeathering(
+                        lvl.terrain ?? createInitialTerrain(),
+                        store.terrainBrushStrength
+                      ),
+                    }))
+                  }
+                  className="flex-1 inline-flex items-center justify-center gap-1.5 py-1.5 px-2.5 rounded-xl bg-[#20B46A]/15 hover:bg-[#20B46A]/25 text-[#20B46A] text-[11px] font-extrabold transition-colors"
+                >
+                  <Wand2 size={12} />
+                  <span>Auto-Weather Cliffs &amp; Caves</span>
+                </button>
+                {Boolean(level.terrain?.weathering) && (
+                  <button
+                    type="button"
+                    onClick={() =>
+                      store.updateLevel('clear terrain weathering', (lvl) => ({
+                        ...lvl,
+                        terrain: clearTerrainWeathering(lvl.terrain ?? createInitialTerrain()),
+                      }))
+                    }
+                    className="py-1.5 px-2.5 rounded-xl bg-white dark:bg-[#151822] hover:text-[#F2545B] text-slate-500 dark:text-[#949BB0] text-[11px] font-bold"
+                  >
+                    Clear
+                  </button>
+                )}
               </div>
             </section>
 

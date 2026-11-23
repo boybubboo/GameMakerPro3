@@ -53,9 +53,16 @@ import {
 } from '../../services/DungeonGenerator';
 import type { MakerStore } from '../../store/useMakerStore';
 import type {
+  BuildingMaterialId,
+  BuildingShapeId,
   CameraMode,
   CarPresetId,
   CreatureBodyId,
+  DoorConfig,
+  DoorFrameShape,
+  DoorLeafStyle,
+  DoorOpenMode,
+  DoorSlotStyle,
   DriverTypeId,
   DrivingCameraView,
   DrivingPhysicsId,
@@ -76,16 +83,26 @@ import type {
   VistaPresetId,
   VistaPropItem,
   VistaPropKind,
-  WeatheringPreset,
 } from '../../types/maker';
+import {
+  BUILDING_MATERIALS,
+  BUILDING_SHAPES,
+  DEFAULT_DOOR_CONFIG,
+} from '../../three/buildingBlocks';
 import {
   CAR_PRESETS,
   DRIVER_TYPES,
   DRIVING_CAMERA_VIEWS,
   DRIVING_PHYSICS_PRESETS,
 } from '../../three/vehicleModels';
+import { WEATHERING_PRESETS } from '../../three/nodeMaterialUtils';
 import { resolveGrassConfig } from '../../three/stylizedGrassSystem';
-import { getEnvironmentType, uid } from '../../utils/terrain';
+import {
+  applySlopeAutoWeathering,
+  createInitialTerrain,
+  getEnvironmentType,
+  uid,
+} from '../../utils/terrain';
 import { CanopyTreeInspector } from '../shared/CanopyTreeInspector';
 import { AssetThumbnail } from '../shared/AssetThumbnail';
 import { ChatBubbleStudioModal } from '../shared/ChatBubbleStudioModal';
@@ -102,7 +119,11 @@ import { TextureStudioModal } from '../world/TextureStudioModal';
 import { VertexPaintModal } from '../world/VertexPaintModal';
 import { WorldViewport3D } from '../world/WorldViewport3D';
 
-const TerrainBrushes: { id: TerrainBrush; title: string; group: 'shape' | 'paint' | 'scatter' }[] = [
+const TerrainBrushes: {
+  id: TerrainBrush;
+  title: string;
+  group: 'shape' | 'paint' | 'degrade' | 'scatter';
+}[] = [
   { id: 'raiseGround', title: 'Raise', group: 'shape' },
   { id: 'lowerGround', title: 'Lower', group: 'shape' },
   { id: 'smoothGround', title: 'Smooth', group: 'shape' },
@@ -117,6 +138,13 @@ const TerrainBrushes: { id: TerrainBrush; title: string; group: 'shape' | 'paint
   { id: 'paintSand', title: 'Sand', group: 'paint' },
   { id: 'paintRock', title: 'Rock', group: 'paint' },
   { id: 'paintSnow', title: 'Snow', group: 'paint' },
+  { id: 'weatherCracks', title: 'Cracks', group: 'degrade' },
+  { id: 'weatherErode', title: 'Erode Cliff', group: 'degrade' },
+  { id: 'weatherMoss', title: 'Moss', group: 'degrade' },
+  { id: 'weatherScorch', title: 'Scorch', group: 'degrade' },
+  { id: 'weatherMud', title: 'Mud', group: 'degrade' },
+  { id: 'weatherFrost', title: 'Frost', group: 'degrade' },
+  { id: 'weatherClear', title: 'Clean', group: 'degrade' },
   { id: 'scatterTree', title: 'Trees', group: 'scatter' },
   { id: 'scatterRock', title: 'Rocks', group: 'scatter' },
   { id: 'scatterFlower', title: 'Flowers', group: 'scatter' },
@@ -156,12 +184,15 @@ export const WorldStage: React.FC<{ store: MakerStore }> = ({ store }) => {
   const setBrushRadius = store.setTerrainBrushRadius;
   const scatterAssetId = store.terrainScatterAssetId;
   const setScatterAssetId = store.setTerrainScatterAssetId;
-  const brushGroup: 'shape' | 'paint' | 'scatter' = useMemo(() => {
+  const brushGroup: 'shape' | 'paint' | 'degrade' | 'scatter' = useMemo(() => {
     const found = TerrainBrushes.find((b) => b.id === brush);
     return found?.group ?? 'shape';
   }, [brush]);
   const [dropKind, setDropKind] = useState<EntityKind>('treasure');
   const [dropCustomAssetId, setDropCustomAssetId] = useState<string>('');
+  const [addPaletteMode, setAddPaletteMode] = useState<'blocks' | 'entities'>('blocks');
+  const [activeBuildShape, setActiveBuildShape] = useState<BuildingShapeId | 'door'>('wallCube');
+  const [activeBuildMaterial, setActiveBuildMaterial] = useState<BuildingMaterialId>('hewnStone');
   const [vistaCustomAssetId, setVistaCustomAssetId] = useState<string>('');
   const [showingMap, setShowingMap] = useState(false);
   const [newObjective, setNewObjective] = useState('');
@@ -1910,6 +1941,10 @@ export const WorldStage: React.FC<{ store: MakerStore }> = ({ store }) => {
               brush={brush}
               brushRadius={brushRadius}
               brushFalloff={store.terrainBrushFalloff}
+              gridSnap={store.worldGridSnap}
+              isPlacingBuildingBlock={
+                activeTool === 'add' && addPaletteMode === 'blocks' && !activePlaceFxTemplate
+              }
               resolutionScale={store.viewportResolutionScale}
               shadowQuality={store.viewportShadowQuality}
               renderPaused={
@@ -1919,7 +1954,7 @@ export const WorldStage: React.FC<{ store: MakerStore }> = ({ store }) => {
                 showingMap
               }
               onSelectEntity={(id) => store.setSelectedEntityID(id)}
-              onMoveEntity={(id, pos) => store.moveEntity(id, pos, false)}
+              onMoveEntity={(id, pos, elev) => store.moveEntity(id, pos, false, elev)}
               onRotateEntity={(id, deg) =>
                 store.updateEntity(id, 'rotate item', (e) => ({ ...e, rotation: Math.round(deg) }), false)
               }
@@ -1956,10 +1991,15 @@ export const WorldStage: React.FC<{ store: MakerStore }> = ({ store }) => {
                   : null
               }
               onDropFxTemplate={handleDropFxTemplate}
-              onAddAtPoint={(pos) => {
+              onAddAtPoint={(pos, elev) => {
                 if (activePlaceFxTemplate) {
                   store.addFxTemplateAtPoint(activePlaceFxTemplate, pos);
                   setPlaceFxTemplateId(null);
+                  setTool('move');
+                } else if (addPaletteMode === 'blocks') {
+                  store.addBuildingBlockEntity(activeBuildShape, activeBuildMaterial, pos, {
+                    elevationY: elev,
+                  });
                 } else if (dropCustomAssetId) {
                   const asset = store.customAssets.find((a) => a.id === dropCustomAssetId);
                   const kind: EntityKind =
@@ -1969,11 +2009,12 @@ export const WorldStage: React.FC<{ store: MakerStore }> = ({ store }) => {
                       ? 'scenery'
                       : 'prop';
                   store.addEntity(kind, asset?.name ?? 'Custom 3D', pos, dropCustomAssetId);
+                  setTool('move');
                 } else {
                   const meta = EntityKindMeta[dropKind];
                   store.addEntity(dropKind, meta.defaultName, pos);
+                  setTool('move');
                 }
-                setTool('move');
               }}
             />
           )}
@@ -1981,7 +2022,7 @@ export const WorldStage: React.FC<{ store: MakerStore }> = ({ store }) => {
           {/* Compact hint at top-left */}
           <div className="pointer-events-none absolute top-3 left-3 px-3 py-1.5 rounded-xl bg-black/70 text-white text-[11px] font-semibold">
             {activeTool === 'move' &&
-              'Click to select · Drag item to move · Drag FX cards onto scene · Drag sky to orbit'}
+              'Click to select · Drag item to move · R rotates 90° · Drag sky to orbit'}
             {activeTool === 'rotate' && 'Drag a selected item left or right to spin it'}
             {activeTool === 'scale' && 'Drag a selected item left or right to resize it'}
             {activeTool === 'terrain' &&
@@ -1989,6 +2030,14 @@ export const WorldStage: React.FC<{ store: MakerStore }> = ({ store }) => {
             {activeTool === 'add' &&
               (activePlaceFxTemplate
                 ? `Click anywhere in the scene to stamp ${activePlaceFxTemplate.name}`
+                : addPaletteMode === 'blocks'
+                ? `Click to place ${
+                    activeBuildShape === 'door'
+                      ? 'Modular Door'
+                      : BUILDING_SHAPES.find((s) => s.id === activeBuildShape)?.label ?? 'Block'
+                  } (${
+                    BUILDING_MATERIALS.find((m) => m.id === activeBuildMaterial)?.label ?? 'Stone'
+                  }) · Click tops to stack · R turns 90°`
                 : dropCustomAssetId
                 ? `Click anywhere in the scene to drop ${
                     store.customAssets.find((a) => a.id === dropCustomAssetId)?.name ?? 'model'
@@ -2034,6 +2083,49 @@ export const WorldStage: React.FC<{ store: MakerStore }> = ({ store }) => {
                     >
                       {t.icon}
                       <span>{t.label}</span>
+                    </button>
+                  );
+                })}
+              </div>
+
+              <button
+                type="button"
+                onClick={() => {
+                  setPlaceFxTemplateId(null);
+                  setAddPaletteMode('blocks');
+                  setTool('add');
+                }}
+                className={`inline-flex items-center gap-1.5 px-3 py-2 rounded-xl text-xs font-extrabold border transition-colors whitespace-nowrap ${
+                  activeTool === 'add' && addPaletteMode === 'blocks' && !activePlaceFxTemplate
+                    ? 'bg-[#F59E0B]/18 border-[#F59E0B] text-[#F59E0B]'
+                    : 'bg-white dark:bg-[#171A23] border-slate-200/80 dark:border-white/[0.08] text-slate-700 dark:text-[#C8D0E4] hover:border-[#F59E0B]'
+                }`}
+              >
+                <Box size={13} />
+                <span>Build Kit</span>
+              </button>
+
+              <div
+                className="inline-flex items-center gap-0.5 p-1 rounded-xl bg-white dark:bg-[#171A23] border border-slate-200/80 dark:border-white/[0.08]"
+                title="Grid Snap spacing for placing and dragging blocks"
+              >
+                <span className="px-1.5 text-[10px] font-bold uppercase tracking-wider text-slate-400 dark:text-[#7D859B]">
+                  Snap
+                </span>
+                {([0, 1, 2] as const).map((snapVal) => {
+                  const active = store.worldGridSnap === snapVal;
+                  return (
+                    <button
+                      key={snapVal}
+                      type="button"
+                      onClick={() => store.setWorldGridSnap(snapVal)}
+                      className={`px-2 py-1 rounded-lg text-[11px] font-bold transition-colors ${
+                        active
+                          ? 'bg-[#20B46A] text-white'
+                          : 'text-slate-500 dark:text-[#949BB0] hover:text-slate-900 dark:hover:text-white'
+                      }`}
+                    >
+                      {snapVal === 0 ? 'Off' : `${snapVal}m`}
                     </button>
                   );
                 })}
@@ -2135,7 +2227,7 @@ export const WorldStage: React.FC<{ store: MakerStore }> = ({ store }) => {
             {activeTool === 'terrain' && (
               <div className="flex flex-wrap items-center gap-2">
                 <div className="inline-flex items-center gap-1 p-1 rounded-xl bg-white dark:bg-[#171A23] border border-slate-200/80 dark:border-white/[0.08]">
-                  {(['shape', 'paint', 'scatter'] as const).map((g) => (
+                  {(['shape', 'paint', 'degrade', 'scatter'] as const).map((g) => (
                     <button
                       key={g}
                       type="button"
@@ -2145,7 +2237,9 @@ export const WorldStage: React.FC<{ store: MakerStore }> = ({ store }) => {
                       }}
                       className={`px-2.5 py-1 rounded-lg text-[11px] font-bold capitalize ${
                         brushGroup === g
-                          ? 'bg-[#F59E0B] text-white'
+                          ? g === 'degrade'
+                            ? 'bg-[#20B46A] text-white'
+                            : 'bg-[#F59E0B] text-white'
                           : 'text-slate-500 dark:text-[#949BB0]'
                       }`}
                     >
@@ -2214,6 +2308,24 @@ export const WorldStage: React.FC<{ store: MakerStore }> = ({ store }) => {
                 );
               })}
 
+              {brushGroup === 'degrade' && (
+                <button
+                  type="button"
+                  onClick={() =>
+                    store.updateLevel('auto-weather cliffs & caves', (lvl) => ({
+                      ...lvl,
+                      terrain: applySlopeAutoWeathering(
+                        lvl.terrain ?? createInitialTerrain(),
+                        store.terrainBrushStrength
+                      ),
+                    }))
+                  }
+                  className="px-3 py-1.5 rounded-xl bg-[#20B46A]/15 hover:bg-[#20B46A]/25 border border-[#20B46A]/40 text-[#20B46A] text-xs font-extrabold transition-colors"
+                >
+                  Auto-Weather Cliffs
+                </button>
+              )}
+
               {brush === 'scatterCustom' && store.customAssets.length > 0 && (
                 <select
                   value={activeScatterAssetId}
@@ -2231,48 +2343,147 @@ export const WorldStage: React.FC<{ store: MakerStore }> = ({ store }) => {
           )}
 
           {activeTool === 'add' && (
-            <div className="flex gap-1.5 overflow-x-auto pb-1 maker-scroll">
-              {DropKinds.map((k) => {
-                const meta = EntityKindMeta[k];
-                const active = !dropCustomAssetId && dropKind === k;
-                return (
+            <div className="space-y-2 p-2.5 rounded-2xl bg-white dark:bg-[#171A23] border border-slate-200/80 dark:border-white/[0.08]">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="inline-flex items-center gap-1 p-0.5 rounded-xl bg-slate-100 dark:bg-[#1F2430]">
                   <button
-                    key={k}
                     type="button"
                     onClick={() => {
-                      setDropCustomAssetId('');
-                      setDropKind(k);
+                      setPlaceFxTemplateId(null);
+                      setAddPaletteMode('blocks');
                     }}
-                    className={`shrink-0 inline-flex items-center gap-2 pl-1.5 pr-3 py-1 rounded-xl text-xs font-bold border transition-colors ${
-                      active
-                        ? 'bg-[#7C5CFF] text-white border-[#7C5CFF]'
-                        : 'bg-white dark:bg-[#171A23] border-slate-200/80 dark:border-white/[0.08] hover:border-[#7C5CFF]'
+                    className={`px-3 py-1 rounded-lg text-[11px] font-extrabold transition-colors ${
+                      addPaletteMode === 'blocks'
+                        ? 'bg-[#F59E0B] text-white'
+                        : 'text-slate-600 dark:text-[#949BB0]'
                     }`}
                   >
-                    <AssetThumbnail kind={k} size={26} rounded="rounded-lg" />
-                    <span className="whitespace-nowrap">{meta.defaultName}</span>
+                    Dungeon &amp; Masonry Kit
                   </button>
-                );
-              })}
-
-              {store.customAssets.map((asset) => {
-                const active = dropCustomAssetId === asset.id;
-                return (
                   <button
-                    key={asset.id}
                     type="button"
-                    onClick={() => setDropCustomAssetId(asset.id)}
-                    className={`shrink-0 inline-flex items-center gap-2 pl-1.5 pr-3 py-1 rounded-xl text-xs font-bold border transition-colors ${
-                      active
-                        ? 'bg-[#20B46A] text-white border-[#20B46A]'
-                        : 'bg-white dark:bg-[#171A23] border-slate-200/80 dark:border-white/[0.08] hover:border-[#20B46A]'
+                    onClick={() => {
+                      setPlaceFxTemplateId(null);
+                      setAddPaletteMode('entities');
+                    }}
+                    className={`px-3 py-1 rounded-lg text-[11px] font-extrabold transition-colors ${
+                      addPaletteMode === 'entities'
+                        ? 'bg-[#7C5CFF] text-white'
+                        : 'text-slate-600 dark:text-[#949BB0]'
                     }`}
                   >
-                    <AssetThumbnail customAsset={asset} size={26} rounded="rounded-lg" />
-                    <span className="whitespace-nowrap">{asset.name}</span>
+                    Cast, Loot &amp; GLBs
                   </button>
-                );
-              })}
+                </div>
+
+                {addPaletteMode === 'blocks' && (
+                  <div className="flex flex-wrap items-center gap-1">
+                    {BUILDING_MATERIALS.map((mat) => {
+                      const active = activeBuildMaterial === mat.id;
+                      return (
+                        <button
+                          key={mat.id}
+                          type="button"
+                          onClick={() => setActiveBuildMaterial(mat.id)}
+                          title={`${mat.label} (${mat.category})`}
+                          className={`inline-flex items-center gap-1.5 px-2 py-1 rounded-lg text-[10px] font-bold border transition-colors ${
+                            active
+                              ? 'border-[#F59E0B] bg-[#F59E0B]/15 text-[#D97706] dark:text-[#FBBF24]'
+                              : 'border-transparent bg-slate-100 dark:bg-[#1F2430] text-slate-600 dark:text-[#949BB0] hover:text-slate-900 dark:hover:text-white'
+                          }`}
+                        >
+                          <span
+                            className="w-2.5 h-2.5 rounded-sm border border-black/25 shrink-0"
+                            style={{ backgroundColor: mat.swatch }}
+                          />
+                          <span>{mat.label}</span>
+                        </button>
+                      );
+                    })}
+                  </div>
+                )}
+              </div>
+
+              {addPaletteMode === 'blocks' ? (
+                <div className="flex gap-1.5 overflow-x-auto pb-0.5 maker-scroll">
+                  {BUILDING_SHAPES.map((shape) => {
+                    const active = activeBuildShape === shape.id;
+                    return (
+                      <button
+                        key={shape.id}
+                        type="button"
+                        title={shape.blurb}
+                        onClick={() => setActiveBuildShape(shape.id)}
+                        className={`shrink-0 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-bold border transition-colors ${
+                          active
+                            ? 'bg-[#7C5CFF] text-white border-[#7C5CFF]'
+                            : 'bg-slate-100 dark:bg-[#1F2430] border-transparent text-slate-700 dark:text-[#C8D0E4] hover:border-[#7C5CFF]'
+                        }`}
+                      >
+                        <Box size={12} />
+                        <span className="whitespace-nowrap">{shape.label}</span>
+                      </button>
+                    );
+                  })}
+                  <button
+                    type="button"
+                    title="Interactive doorway with arched/rectangular frame, plank/metal/bar/cage leaves & peep slots"
+                    onClick={() => setActiveBuildShape('door')}
+                    className={`shrink-0 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl text-xs font-bold border transition-colors ${
+                      activeBuildShape === 'door'
+                        ? 'bg-[#20B46A] text-white border-[#20B46A]'
+                        : 'bg-slate-100 dark:bg-[#1F2430] border-transparent text-slate-700 dark:text-[#C8D0E4] hover:border-[#20B46A]'
+                    }`}
+                  >
+                    <Layers size={12} />
+                    <span className="whitespace-nowrap">Modular Door</span>
+                  </button>
+                </div>
+              ) : (
+                <div className="flex gap-1.5 overflow-x-auto pb-0.5 maker-scroll">
+                  {DropKinds.map((k) => {
+                    const meta = EntityKindMeta[k];
+                    const active = !dropCustomAssetId && dropKind === k;
+                    return (
+                      <button
+                        key={k}
+                        type="button"
+                        onClick={() => {
+                          setDropCustomAssetId('');
+                          setDropKind(k);
+                        }}
+                        className={`shrink-0 inline-flex items-center gap-2 pl-1.5 pr-3 py-1 rounded-xl text-xs font-bold border transition-colors ${
+                          active
+                            ? 'bg-[#7C5CFF] text-white border-[#7C5CFF]'
+                            : 'bg-slate-100 dark:bg-[#1F2430] border-transparent hover:border-[#7C5CFF]'
+                        }`}
+                      >
+                        <AssetThumbnail kind={k} size={26} rounded="rounded-lg" />
+                        <span className="whitespace-nowrap">{meta.defaultName}</span>
+                      </button>
+                    );
+                  })}
+
+                  {store.customAssets.map((asset) => {
+                    const active = dropCustomAssetId === asset.id;
+                    return (
+                      <button
+                        key={asset.id}
+                        type="button"
+                        onClick={() => setDropCustomAssetId(asset.id)}
+                        className={`shrink-0 inline-flex items-center gap-2 pl-1.5 pr-3 py-1 rounded-xl text-xs font-bold border transition-colors ${
+                          active
+                            ? 'bg-[#20B46A] text-white border-[#20B46A]'
+                            : 'bg-slate-100 dark:bg-[#1F2430] border-transparent hover:border-[#20B46A]'
+                        }`}
+                      >
+                        <AssetThumbnail customAsset={asset} size={26} rounded="rounded-lg" />
+                        <span className="whitespace-nowrap">{asset.name}</span>
+                      </button>
+                    );
+                  })}
+                </div>
+              )}
             </div>
           )}
           {showingFxLibrary && (
@@ -2336,12 +2547,40 @@ export const WorldStage: React.FC<{ store: MakerStore }> = ({ store }) => {
             </div>
 
             <div className="space-y-3 pt-2 border-t border-slate-200/70 dark:border-white/[0.08]">
-              <div className="space-y-1">
-                <div className="flex justify-between text-xs font-semibold">
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between text-xs font-semibold">
                   <span>Turn</span>
-                  <span className="tabular-nums text-slate-500 dark:text-[#949BB0]">
-                    {Math.round(currentEntity.rotation)}°
-                  </span>
+                  <div className="flex items-center gap-1">
+                    <button
+                      type="button"
+                      onClick={() =>
+                        store.updateEntity(currentEntity.id, 'rotate -90°', (ent) => ({
+                          ...ent,
+                          rotation: (Math.round((ent.rotation - 90) / 90) * 90 + 360) % 360,
+                        }))
+                      }
+                      className="px-1.5 py-0.5 rounded bg-slate-100 dark:bg-[#1F2430] hover:bg-[#7C5CFF]/20 text-[10px] font-bold"
+                      title="Turn -90°"
+                    >
+                      -90°
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() =>
+                        store.updateEntity(currentEntity.id, 'rotate +90°', (ent) => ({
+                          ...ent,
+                          rotation: (Math.round((ent.rotation + 90) / 90) * 90 + 360) % 360,
+                        }))
+                      }
+                      className="px-1.5 py-0.5 rounded bg-slate-100 dark:bg-[#1F2430] hover:bg-[#7C5CFF]/20 text-[10px] font-bold"
+                      title="Turn +90° (or press R)"
+                    >
+                      +90°
+                    </button>
+                    <span className="tabular-nums text-slate-500 dark:text-[#949BB0] ml-1">
+                      {Math.round(currentEntity.rotation)}°
+                    </span>
+                  </div>
                 </div>
                 <input
                   type="range"
@@ -2358,6 +2597,41 @@ export const WorldStage: React.FC<{ store: MakerStore }> = ({ store }) => {
                   }
                   className="w-full accent-[#7C5CFF]"
                 />
+              </div>
+
+              <div className="space-y-1.5">
+                <div className="flex items-center justify-between text-xs font-semibold">
+                  <span>Elevation (Stack Y)</span>
+                  <span className="tabular-nums text-slate-500 dark:text-[#949BB0]">
+                    {(currentEntity.elevationY ?? 0).toFixed(2)}m
+                  </span>
+                </div>
+                <div className="grid grid-cols-5 gap-1">
+                  {[
+                    { label: '-2m', delta: -2 },
+                    { label: '-0.5m', delta: -0.5 },
+                    { label: '0m', delta: null },
+                    { label: '+0.5m', delta: 0.5 },
+                    { label: '+2m', delta: 2 },
+                  ].map((btn) => (
+                    <button
+                      key={btn.label}
+                      type="button"
+                      onClick={() =>
+                        store.updateEntity(currentEntity.id, 'change elevation', (ent) => ({
+                          ...ent,
+                          elevationY:
+                            btn.delta === null
+                              ? 0
+                              : Number(Math.max(-4, (ent.elevationY ?? 0) + btn.delta).toFixed(2)),
+                        }))
+                      }
+                      className="py-1 rounded-lg bg-slate-100 dark:bg-[#1F2430] hover:bg-[#7C5CFF]/20 text-[10px] font-bold"
+                    >
+                      {btn.label}
+                    </button>
+                  ))}
+                </div>
               </div>
 
               <div className="space-y-1">
@@ -2385,6 +2659,265 @@ export const WorldStage: React.FC<{ store: MakerStore }> = ({ store }) => {
                 />
               </div>
             </div>
+
+            {currentEntity.buildingBlock && (() => {
+              const bb = currentEntity.buildingBlock!;
+              const patchBb = (label: string, patch: Partial<typeof bb>) =>
+                store.updateEntity(currentEntity.id, label, (ent) => ({
+                  ...ent,
+                  buildingBlock: { ...(ent.buildingBlock ?? bb), ...patch },
+                }));
+              return (
+                <div className="p-2.5 rounded-xl bg-slate-100 dark:bg-[#1F2430] space-y-2.5">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500 dark:text-[#949BB0]">
+                      Building Block
+                    </span>
+                    <span className="text-[10px] font-bold text-[#F59E0B]">2m Grid Kit</span>
+                  </div>
+
+                  <label className="block space-y-1">
+                    <span className="text-[10px] font-bold text-slate-500 dark:text-[#949BB0]">
+                      Shape
+                    </span>
+                    <select
+                      value={bb.shape}
+                      onChange={(e) =>
+                        patchBb('change block shape', { shape: e.target.value as BuildingShapeId })
+                      }
+                      className="w-full px-2.5 py-1.5 rounded-lg bg-white dark:bg-[#171A23] text-xs font-semibold"
+                    >
+                      {BUILDING_SHAPES.map((s) => (
+                        <option key={s.id} value={s.id}>
+                          {s.label} — {s.blurb}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+
+                  <div className="space-y-1">
+                    <span className="text-[10px] font-bold text-slate-500 dark:text-[#949BB0] block">
+                      Surface Material
+                    </span>
+                    <div className="grid grid-cols-3 gap-1">
+                      {BUILDING_MATERIALS.map((mat) => {
+                        const active = bb.material === mat.id;
+                        return (
+                          <button
+                            key={mat.id}
+                            type="button"
+                            onClick={() => patchBb('change block material', { material: mat.id })}
+                            className={`flex items-center gap-1 px-1.5 py-1 rounded-lg text-[10px] font-bold border transition-colors ${
+                              active
+                                ? 'border-[#F59E0B] bg-[#F59E0B]/15 text-[#D97706] dark:text-[#FBBF24]'
+                                : 'border-transparent bg-white dark:bg-[#171A23] text-slate-600 dark:text-[#949BB0]'
+                            }`}
+                          >
+                            <span
+                              className="w-2.5 h-2.5 rounded-sm border border-black/25 shrink-0"
+                              style={{ backgroundColor: mat.swatch }}
+                            />
+                            <span className="truncate">{mat.label.split(' ')[0]}</span>
+                          </button>
+                        );
+                      })}
+                    </div>
+                  </div>
+
+                  {bb.shape === 'archway' && (
+                    <div className="space-y-1">
+                      <span className="text-[10px] font-bold text-slate-500 dark:text-[#949BB0] block">
+                        Archway Style
+                      </span>
+                      <div className="grid grid-cols-2 gap-1">
+                        {(['arched', 'rectangular'] as const).map((styleId) => (
+                          <button
+                            key={styleId}
+                            type="button"
+                            onClick={() => patchBb('change archway style', { archStyle: styleId })}
+                            className={`py-1 rounded-lg text-[11px] font-bold capitalize ${
+                              (bb.archStyle ?? 'arched') === styleId
+                                ? 'bg-[#7C5CFF] text-white'
+                                : 'bg-white dark:bg-[#171A23] text-slate-600 dark:text-[#949BB0]'
+                            }`}
+                          >
+                            {styleId}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+
+                  {bb.shape === 'windowWall' && (
+                    <div className="space-y-1">
+                      <span className="text-[10px] font-bold text-slate-500 dark:text-[#949BB0] block">
+                        Window Style
+                      </span>
+                      <div className="grid grid-cols-3 gap-1">
+                        {(['open', 'barred', 'shuttered'] as const).map((wId) => (
+                          <button
+                            key={wId}
+                            type="button"
+                            onClick={() => patchBb('change window style', { windowStyle: wId })}
+                            className={`py-1 rounded-lg text-[10px] font-bold capitalize ${
+                              (bb.windowStyle ?? 'barred') === wId
+                                ? 'bg-[#7C5CFF] text-white'
+                                : 'bg-white dark:bg-[#171A23] text-slate-600 dark:text-[#949BB0]'
+                            }`}
+                          >
+                            {wId}
+                          </button>
+                        ))}
+                      </div>
+                    </div>
+                  )}
+                </div>
+              );
+            })()}
+
+            {currentEntity.kind === 'door' && (() => {
+              const dc = currentEntity.doorConfig;
+              const patchDoor = (label: string, patch: Partial<DoorConfig>) =>
+                store.updateEntity(currentEntity.id, label, (ent) => ({
+                  ...ent,
+                  doorConfig: { ...(ent.doorConfig ?? DEFAULT_DOOR_CONFIG), ...patch },
+                }));
+              return (
+                <div className="p-2.5 rounded-xl bg-slate-100 dark:bg-[#1F2430] space-y-2.5">
+                  <div className="flex items-center justify-between">
+                    <span className="text-[10px] font-bold uppercase tracking-wider text-slate-500 dark:text-[#949BB0]">
+                      Door Customizer
+                    </span>
+                    {!dc && (
+                      <button
+                        type="button"
+                        onClick={() => patchDoor('enable modular door', {})}
+                        className="px-2 py-0.5 rounded-lg bg-[#7C5CFF] text-white text-[10px] font-bold"
+                      >
+                        Customize Style
+                      </button>
+                    )}
+                  </div>
+
+                  {dc && (
+                    <div className="space-y-2">
+                      <div className="grid grid-cols-2 gap-1.5">
+                        <label className="space-y-1">
+                          <span className="text-[10px] font-bold text-slate-500 dark:text-[#949BB0] block">
+                            Frame
+                          </span>
+                          <select
+                            value={dc.frameShape}
+                            onChange={(e) =>
+                              patchDoor('change door frame', {
+                                frameShape: e.target.value as DoorFrameShape,
+                              })
+                            }
+                            className="w-full px-2 py-1 rounded-lg bg-white dark:bg-[#171A23] text-[11px] font-semibold"
+                          >
+                            <option value="arched">Arched</option>
+                            <option value="rectangular">Rectangular</option>
+                          </select>
+                        </label>
+                        <label className="space-y-1">
+                          <span className="text-[10px] font-bold text-slate-500 dark:text-[#949BB0] block">
+                            Open Mode
+                          </span>
+                          <select
+                            value={dc.openMode}
+                            onChange={(e) =>
+                              patchDoor('change door open mode', {
+                                openMode: e.target.value as DoorOpenMode,
+                              })
+                            }
+                            className="w-full px-2 py-1 rounded-lg bg-white dark:bg-[#171A23] text-[11px] font-semibold"
+                          >
+                            <option value="hingedSide">Side Swing</option>
+                            <option value="doubleSplit">Middle Split</option>
+                            <option value="sliding">Sliding Up</option>
+                          </select>
+                        </label>
+                      </div>
+
+                      <div className="grid grid-cols-2 gap-1.5">
+                        <label className="space-y-1">
+                          <span className="text-[10px] font-bold text-slate-500 dark:text-[#949BB0] block">
+                            Leaf Style
+                          </span>
+                          <select
+                            value={dc.leafStyle}
+                            onChange={(e) =>
+                              patchDoor('change door leaf style', {
+                                leafStyle: e.target.value as DoorLeafStyle,
+                              })
+                            }
+                            className="w-full px-2 py-1 rounded-lg bg-white dark:bg-[#171A23] text-[11px] font-semibold"
+                          >
+                            <option value="woodPlank">Wooden Plank</option>
+                            <option value="solidMetal">Solid Iron</option>
+                            <option value="ironBars">Metal Bars</option>
+                            <option value="jailCage">Jail Cage</option>
+                          </select>
+                        </label>
+                        <label className="space-y-1">
+                          <span className="text-[10px] font-bold text-slate-500 dark:text-[#949BB0] block">
+                            Window / Slot
+                          </span>
+                          <select
+                            value={dc.slotStyle}
+                            onChange={(e) =>
+                              patchDoor('change door slot style', {
+                                slotStyle: e.target.value as DoorSlotStyle,
+                              })
+                            }
+                            className="w-full px-2 py-1 rounded-lg bg-white dark:bg-[#171A23] text-[11px] font-semibold"
+                          >
+                            <option value="none">Solid (None)</option>
+                            <option value="peepSlot">Peep Slot</option>
+                            <option value="barredWindow">Barred Window</option>
+                          </select>
+                        </label>
+                      </div>
+
+                      <label className="block space-y-1">
+                        <span className="text-[10px] font-bold text-slate-500 dark:text-[#949BB0]">
+                          Frame Material
+                        </span>
+                        <select
+                          value={dc.frameMaterial ?? 'hewnStone'}
+                          onChange={(e) =>
+                            patchDoor('change door frame material', {
+                              frameMaterial: e.target.value as BuildingMaterialId,
+                            })
+                          }
+                          className="w-full px-2 py-1 rounded-lg bg-white dark:bg-[#171A23] text-[11px] font-semibold"
+                        >
+                          {BUILDING_MATERIALS.map((mat) => (
+                            <option key={mat.id} value={mat.id}>
+                              {mat.label}
+                            </option>
+                          ))}
+                        </select>
+                      </label>
+
+                      <label className="flex items-center justify-between text-xs font-semibold cursor-pointer pt-0.5">
+                        <span>Requires Key to Unlock</span>
+                        <input
+                          type="checkbox"
+                          checked={Boolean(dc.requiresKey)}
+                          onChange={(e) =>
+                            patchDoor('toggle door key requirement', {
+                              requiresKey: e.target.checked,
+                            })
+                          }
+                          className="accent-[#F59E0B] w-4 h-4"
+                        />
+                      </label>
+                    </div>
+                  )}
+                </div>
+              );
+            })()}
 
             {currentEntity.kind === 'npc' && (
               <div className="p-2.5 rounded-xl bg-slate-100 dark:bg-[#1F2430] space-y-2">
@@ -2627,32 +3160,104 @@ export const WorldStage: React.FC<{ store: MakerStore }> = ({ store }) => {
                     />
                   </div>
 
+                  <div className="space-y-1 pt-1 border-t border-slate-200/60 dark:border-white/[0.06]">
+                    {(() => {
+                      const wearVal = currentEntity.materialVariant?.wearFactor ?? 0;
+                      const wearLabel =
+                        wearVal <= 0.01
+                          ? 'Pristine'
+                          : wearVal < 0.28
+                          ? 'Light Scuffs'
+                          : wearVal < 0.56
+                          ? 'Worn Edges'
+                          : wearVal < 0.82
+                          ? 'Deep Dings'
+                          : 'Battered';
+                      return (
+                        <>
+                          <div className="flex items-center justify-between gap-2 text-[11px] font-semibold">
+                            <span>Wear Intensity</span>
+                            <div className="flex items-center gap-1.5">
+                              <span
+                                className={`text-[10px] font-bold ${
+                                  wearVal > 0.01
+                                    ? 'text-[#D97706] dark:text-[#FBBF24]'
+                                    : 'text-slate-400 dark:text-[#7D859B]'
+                                }`}
+                              >
+                                {wearLabel}
+                              </span>
+                              <span className="tabular-nums text-slate-500 dark:text-[#949BB0]">
+                                {Math.round(wearVal * 100)}%
+                              </span>
+                            </div>
+                          </div>
+                          <input
+                            type="range"
+                            min={0}
+                            max={1}
+                            step={0.01}
+                            value={wearVal}
+                            aria-label="Wear Intensity"
+                            onChange={(e) => {
+                              const wearFactor = Number(e.target.value);
+                              store.updateEntity(
+                                currentEntity.id,
+                                'adjust object wear factor',
+                                (ent) => ({
+                                  ...ent,
+                                  materialVariant: {
+                                    ...ent.materialVariant,
+                                    wearFactor,
+                                  },
+                                }),
+                                false
+                              );
+                            }}
+                            className="w-full accent-[#D97706]"
+                          />
+                          <p className="text-[10px] text-slate-400 dark:text-[#7D859B] leading-tight">
+                            Controls how deep &amp; extensive dings, chips &amp; scratches appear on this block.
+                          </p>
+                        </>
+                      );
+                    })()}
+                  </div>
+
                   <div className="space-y-1">
-                    <span className="text-[11px] font-semibold block">Weathering</span>
-                    <div className="grid grid-cols-4 gap-1">
-                      {(['none', 'moss', 'snow', 'wet'] as WeatheringPreset[]).map((preset) => {
-                        const active = (currentEntity.materialVariant?.weathering ?? 'none') === preset;
+                    <span className="text-[11px] font-semibold block">
+                      Weathering / Degrading
+                    </span>
+                    <div className="grid grid-cols-5 gap-1">
+                      {WEATHERING_PRESETS.map((preset) => {
+                        const active =
+                          (currentEntity.materialVariant?.weathering ?? 'none') === preset.id;
                         return (
                           <button
-                            key={preset}
+                            key={preset.id}
                             type="button"
+                            title={preset.shortDesc}
                             onClick={() =>
                               store.updateEntity(currentEntity.id, 'set weathering preset', (ent) => ({
                                 ...ent,
                                 materialVariant: {
                                   ...ent.materialVariant,
-                                  weathering: preset,
+                                  weathering: preset.id,
                                   weatheringIntensity: ent.materialVariant?.weatheringIntensity ?? 0.65,
                                 },
                               }))
                             }
-                            className={`py-1 rounded-lg text-[10px] font-bold capitalize transition-colors ${
+                            className={`flex items-center justify-center gap-1 py-1 px-1 rounded-lg text-[10px] font-bold transition-colors ${
                               active
                                 ? 'bg-[#7C5CFF] text-white'
                                 : 'bg-white dark:bg-[#171A23] text-slate-600 dark:text-[#949BB0] hover:bg-slate-200 dark:hover:bg-[#272D3C]'
                             }`}
                           >
-                            {preset}
+                            <span
+                              className="w-2 h-2 rounded-full border border-black/20 shrink-0"
+                              style={{ backgroundColor: preset.swatch }}
+                            />
+                            <span className="truncate">{preset.label}</span>
                           </button>
                         );
                       })}
@@ -2709,21 +3314,25 @@ export const WorldStage: React.FC<{ store: MakerStore }> = ({ store }) => {
                   <span>Customize Chat Bubble</span>
                 </button>
               )}
-              {currentEntity.kind !== 'fxEmitter' && !currentEntity.canopyTree && (
-                <button
-                  type="button"
-                  onClick={() => setVertexPaintTargetId(currentEntity.id)}
-                  className="w-full py-2 rounded-xl bg-[#EC4899]/15 text-xs font-bold text-[#EC4899] hover:bg-[#EC4899]/25 inline-flex items-center justify-center gap-1.5"
-                >
-                  <Paintbrush size={13} />
-                  <span>Vertex Paint Object</span>
-                  {(currentEntity.vertexPaintStrokes?.length ?? 0) > 0 && (
-                    <span className="tabular-nums text-[10px] opacity-85">
-                      ({currentEntity.vertexPaintStrokes!.length})
-                    </span>
-                  )}
-                </button>
-              )}
+              {currentEntity.kind !== 'fxEmitter' && (() => {
+                const vpCount =
+                  currentEntity.canopyTree?.vertexPaintStrokes?.length ??
+                  currentEntity.vertexPaintStrokes?.length ??
+                  0;
+                return (
+                  <button
+                    type="button"
+                    onClick={() => setVertexPaintTargetId(currentEntity.id)}
+                    className="w-full py-2 rounded-xl bg-[#EC4899]/15 text-xs font-bold text-[#EC4899] hover:bg-[#EC4899]/25 inline-flex items-center justify-center gap-1.5"
+                  >
+                    <Paintbrush size={13} />
+                    <span>Vertex Paint &amp; Degrade</span>
+                    {vpCount > 0 && (
+                      <span className="tabular-nums text-[10px] opacity-85">({vpCount})</span>
+                    )}
+                  </button>
+                );
+              })()}
               {currentEntity.kind !== 'fxEmitter' && (
                 <button
                   type="button"

@@ -118,14 +118,14 @@ export const ProjectBrowser: React.FC<{ store: MakerStore }> = ({ store }) => {
             <input
               ref={fileInputRef}
               type="file"
-              accept=".maker,.json,.txt"
+              accept=".maker,.zip,.json,.txt"
               className="hidden"
               onChange={(e) => void handleFileChange(e)}
             />
             <button
               type="button"
               onClick={() => fileInputRef.current?.click()}
-              title="Open a compressed .maker backup or .json game file"
+              title="Open an exported .zip adventure, compressed .maker backup, or .json game file"
               className="inline-flex items-center gap-2 px-3.5 py-2 rounded-xl bg-white dark:bg-[#171A23] border border-slate-200/80 dark:border-white/[0.1] text-xs font-bold hover:border-[#7C5CFF]/60 transition-colors whitespace-nowrap"
             >
               <FolderOpen size={14} className="text-[#38BDF8]" />
